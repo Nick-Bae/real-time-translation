@@ -1,14 +1,25 @@
-// ✅ TranslationForm.tsx (React Component)
+// ✅ TranslationForm.tsx (with Web Speech API and volume/mute controls)
 // Path: frontend/components/TranslationForm.tsx
 
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 
 export default function TranslationForm() {
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [loading, setLoading] = useState(false)
+  const [isMuted, setIsMuted] = useState(false)
+  const [volume, setVolume] = useState(1)
+
+  const synthRef = useRef<any>(null)
+
+useEffect(() => {
+  if (typeof window !== 'undefined') {
+    synthRef.current = window.speechSynthesis
+  }
+}, [])
+
 
   const handleTranslate = async () => {
     if (!text.trim()) return
@@ -27,6 +38,12 @@ export default function TranslationForm() {
       })
       const data = await response.json()
       setTranslated(data.translated || 'Translation failed')
+      if (!isMuted && data.translated) {
+        const utterance = new SpeechSynthesisUtterance(data.translated)
+        utterance.lang = 'zh-CN'
+        utterance.volume = volume // Volume: 0.0 to 1.0
+        synthRef.current.speak(utterance)
+      }
     } catch (error) {
       console.error('Error translating:', error)
       setTranslated('Error during translation')
@@ -43,13 +60,33 @@ export default function TranslationForm() {
         className="w-full h-32 p-2 border border-gray-300 rounded-md mb-4"
         placeholder="Enter Korean sermon line here..."
       ></textarea>
-      <button
-        onClick={handleTranslate}
-        disabled={loading}
-        className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition"
-      >
-        {loading ? 'Translating...' : 'Translate'}
-      </button>
+      <div className="flex items-center gap-4 mb-4">
+        <button
+          onClick={handleTranslate}
+          disabled={loading}
+          className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition"
+        >
+          {loading ? 'Translating...' : 'Translate'}
+        </button>
+        <button
+          onClick={() => setIsMuted(!isMuted)}
+          className={`px-4 py-2 rounded ${isMuted ? 'bg-gray-400' : 'bg-green-600 text-white'} hover:opacity-90 transition`}
+        >
+          {isMuted ? 'Unmute' : 'Mute'}
+        </button>
+        <div className="flex items-center">
+          <label className="mr-2 text-gray-600">Volume</label>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.1}
+            value={volume}
+            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            className="w-24"
+          />
+        </div>
+      </div>
       {translated && (
         <div className="mt-6">
           <h3 className="text-lg font-medium text-gray-800 mb-2">Translated Text (Chinese):</h3>
