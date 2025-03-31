@@ -19,13 +19,13 @@ export default function TranslationBox() {
   const [isMuted, setIsMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [pauseListening, setPauseListening] = useState(false)
+  const [selectedVoiceName, setSelectedVoiceName] = useState('')
 
   const synthRef = useRef<any>(null)
   const recognitionRef = useRef<any>(null)
   const ttsQueueRef = useRef<string[]>([]) // ✅ Queue for managing TTS playback
   const isSpeakingRef = useRef<boolean>(false) // ✅ Track if TTS is speaking
   const isCancelledRef = useRef<boolean>(false) // ✅ Prevent excessive cancellation
-  const [selectedVoiceName, setSelectedVoiceName] = useState('')
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -42,19 +42,6 @@ export default function TranslationBox() {
     }
   }, [])
 
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      synthRef.current = window.speechSynthesis
-
-      // ✅ Wait for voices to load before proceeding
-      setTimeout(() => {
-        console.log('✅ Available voices:', synthRef.current.getVoices())
-      }, 1000)
-    }
-  }, [])
-
-
   // Initialize Web Speech API after component mounts
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -63,18 +50,18 @@ export default function TranslationBox() {
       if ('webkitSpeechRecognition' in window) {
         const recognition = new (window as any).webkitSpeechRecognition()
         recognition.lang = sourceLang
-        recognition.continuous = true // ✅ Continuous listening enabled
+        recognition.continuous = true
         recognition.interimResults = false
 
         recognition.onresult = (event: any) => {
           const resultText = event.results[event.results.length - 1][0].transcript
-          setText(resultText.trim()) // ✅ Reset to only keep the latest result
+          setText(resultText.trim())
           handleTranslate(resultText.trim())
         }
 
         recognition.onend = () => {
           if (isListening && !pauseListening) {
-            recognition.start() // ✅ Restart recognition automatically
+            recognition.start()
           } else {
             setIsListening(false)
           }
@@ -92,38 +79,11 @@ export default function TranslationBox() {
     }
   }, [text])
 
-  // ✅ Enqueue translation for TTS playback
-  const enqueueTranslation = (translatedText: string) => {
-    if (!translatedText.trim()) {
-      console.warn('⚠️ Empty or invalid translation. Skipping...')
-      return
-    }
-
-    // ✅ Cancel ongoing speech only if necessary
-    if (synthRef.current.speaking || synthRef.current.pending) {
-      console.warn('🛑 Cancelling previous speech to avoid overlap...')
-      synthRef.current.cancel()
-    }
-
-    // ✅ Push clean text into the queue
-    ttsQueueRef.current.push(translatedText)
-    console.log('🎧 Enqueuing clean text for speech:', translatedText)
-    if (!isSpeakingRef.current) {
-      playNextInQueue() // ✅ Start playing if no active speech
-    }
-  }
-
-  // Handle text translation
+  // ✅ Handle text translation
   const handleTranslate = async (inputText: string) => {
     if (!inputText.trim()) return
-    if (isSpeakingRef.current) {
-      console.warn('⚠️ Speech already in progress. Skipping this translation...')
-      return
-    }
-
     setLoading(true)
     try {
-      // ✅ Correctly define response before parsing JSON
       const response = await fetch('http://localhost:8000/api/translate', {
         method: 'POST',
         headers: {
@@ -136,37 +96,21 @@ export default function TranslationBox() {
         }),
       })
 
-      // ✅ Check if response is OK before parsing
       if (!response.ok) {
         throw new Error(`Failed to fetch translation. Status: ${response.status}`)
       }
 
       const data = await response.json()
-
-      // ✅ Add debug log to verify API response
-      console.log('API Response:', data)
-
-      // ✅ Corrected translation handling
-      const translation = data.translated || data.translation || 'Translation failed'
-
-      // ✅ Check and clean translation properly
+      const translation = data.translated || 'Translation failed'
       let cleanTranslation = translation.replace(/^Translated.*?:\s*/, '').trim()
 
-      // ✅ Log for debugging
-      console.log('✅ Cleaned Translation:', cleanTranslation)
-
-      // ✅ Check if translation is still in Korean (likely untranslated)
       if (cleanTranslation.match(/[\u3131-\uD79D]/)) {
-        console.warn('⚠️ Translation is still in Korean. Check API or translation logic.')
         cleanTranslation = 'Translation failed. Please check settings.'
       }
 
-      // ✅ Set clean translation and update UI
       setTranslated(cleanTranslation)
-
-      // ✅ Send the correct translated text to TTS
-      if (!isMuted && translation !== 'Translation failed') {
-        enqueueTranslation(cleanTranslation) // ✅ Send clean translation to TTS
+      if (!isMuted && cleanTranslation !== 'Translation failed') {
+        enqueueTranslation(cleanTranslation)
       }
     } catch (error) {
       console.error('❌ Error translating:', error)
@@ -175,8 +119,23 @@ export default function TranslationBox() {
     setLoading(false)
   }
 
+  // ✅ Enqueue translation for TTS playback
+  const enqueueTranslation = (translatedText: string) => {
+    if (!translatedText.trim()) {
+      console.warn('⚠️ Empty or invalid translation. Skipping...')
+      return
+    }
 
-  // Play the next sentence in the queue
+    if (synthRef.current.speaking || synthRef.current.pending) {
+      synthRef.current.cancel()
+    }
+
+    ttsQueueRef.current.push(translatedText)
+    if (!isSpeakingRef.current) {
+      playNextInQueue()
+    }
+  }
+
   // ✅ Play the next sentence in the queue
   const playNextInQueue = () => {
     if (
@@ -186,8 +145,6 @@ export default function TranslationBox() {
       synthRef.current.speaking ||
       synthRef.current.pending
     ) {
-      console.warn('⚠️ Queue empty or speech in progress. Skipping queue play...')
-      isSpeakingRef.current = false
       return
     }
 
@@ -195,7 +152,6 @@ export default function TranslationBox() {
     if (nextText && synthRef.current) {
       setTimeout(() => {
         if (synthRef.current.speaking) {
-          console.warn('🛑 Cancelling previous speech to avoid overlap...')
           synthRef.current.cancel()
         }
 
@@ -203,19 +159,13 @@ export default function TranslationBox() {
         utterance.lang = targetLang
         utterance.volume = volume
 
-        // ✅ Choose a female voice if available
         const voices = synthRef.current.getVoices()
-        
-          const selectedVoice = voices.find((v) => v.name === selectedVoiceName) || voices[0]
+        const selectedVoice = voices.find((v) => v.name === selectedVoiceName) || voices[0]
 
         utterance.voice = selectedVoice
-
-        console.log('🎙️ Using voice:', selectedVoice.name, 'for language:', targetLang)
-
         isSpeakingRef.current = true
 
         utterance.onend = () => {
-          console.log('✅ Finished speaking:', nextText)
           isSpeakingRef.current = false
           if (ttsQueueRef.current.length > 0) {
             playNextInQueue()
@@ -231,21 +181,20 @@ export default function TranslationBox() {
         }
 
         synthRef.current.speak(utterance)
-      }, 300) // ✅ Small delay to prevent overlap
+      }, 300)
     }
   }
 
-  // Start or stop microphone
+  // ✅ Start or stop microphone
   const handleStartListening = () => {
     if (recognitionRef.current) {
-      setText('') // ✅ Clear text before starting new session
-      setTranslated('') // ✅ Clear previous translation
-      ttsQueueRef.current = [] // ✅ Clear the queue
-      synthRef.current.cancel() // ✅ Cancel any ongoing speech
+      setText('')
+      setTranslated('')
+      ttsQueueRef.current = []
+      synthRef.current.cancel()
       isSpeakingRef.current = false
       recognitionRef.current.start()
       setIsListening(true)
-      console.log('🎙️ Listening started. Previous speech cleared.')
     } else {
       alert('Speech recognition is not supported in this browser.')
     }
@@ -258,31 +207,37 @@ export default function TranslationBox() {
     }
   }
 
-  // Clear input, reset and stop TTS
+  // ✅ Clear input, reset and stop TTS
   const handleClear = () => {
     setText('')
     setTranslated('')
     handleStopListening()
     if (synthRef.current) {
-      synthRef.current.cancel() // ✅ Stop ongoing TTS immediately
+      synthRef.current.cancel()
     }
-    ttsQueueRef.current = [] // ✅ Clear TTS queue
-    isCancelledRef.current = false // ✅ Reset cancellation flag
+    ttsQueueRef.current = []
   }
 
-
   return (
-    <div className="w-full max-w-2xl mx-auto p-4 bg-white rounded-xl shadow-md">
-      <h2 className="text-xl font-semibold text-gray-700 mb-4">🎤 Real-Time Translator</h2>
+    <div className="w-full max-w-3xl mx-auto p-6 bg-white rounded-xl shadow-md">
+      {/* ✅ Header Section */}
+      <h2 className="text-2xl font-bold text-gray-700 mb-4 text-center">🎤 Real-Time Translator</h2>
 
-      {/* Language Selection */}
+      {/* ✅ Status Bar */}
+      {loading && (
+        <div className="mb-4 text-blue-500 text-sm text-center animate-pulse">
+          Translating... Please wait.
+        </div>
+      )}
+
+      {/* ✅ Language & Voice Controls */}
       <div className="flex gap-4 mb-4">
         <div className="flex flex-col w-1/2">
-          <label className="text-gray-600">Source Language</label>
+          <label className="text-gray-600 mb-1">Source Language</label>
           <select
             value={sourceLang}
             onChange={(e) => setSourceLang(e.target.value)}
-            className="p-2 border rounded"
+            className="p-2 border rounded shadow-sm focus:outline-none"
           >
             {availableLanguages.map((lang) => (
               <option key={lang.code} value={lang.code}>
@@ -292,11 +247,11 @@ export default function TranslationBox() {
           </select>
         </div>
         <div className="flex flex-col w-1/2">
-          <label className="text-gray-600">Target Language</label>
+          <label className="text-gray-600 mb-1">Target Language</label>
           <select
             value={targetLang}
             onChange={(e) => setTargetLang(e.target.value)}
-            className="p-2 border rounded"
+            className="p-2 border rounded shadow-sm focus:outline-none"
           >
             {availableLanguages.map((lang) => (
               <option key={lang.code} value={lang.code}>
@@ -307,48 +262,52 @@ export default function TranslationBox() {
         </div>
       </div>
 
-      {/* Input and Controls */}
-      <div className="flex items-center gap-2 mb-4">
+      {/* ✅ Text Input and Controls */}
+      <div className="flex gap-4 items-center mb-4">
         <textarea
           value={text}
           onChange={(e) => setText(e.target.value)}
-          className="w-full h-32 p-2 border border-gray-300 rounded-md"
+          className="w-full h-32 p-3 border rounded-md shadow-sm focus:outline-none"
           placeholder="Type or speak here..."
-        ></textarea>
+        />
         <button
           onClick={isListening ? handleStopListening : handleStartListening}
-          className={`p-3 rounded-full ${isListening ? 'bg-red-600' : 'bg-blue-600'} text-white hover:opacity-80`}
+          className={`p-3 rounded-full text-white transition ${
+            isListening ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'
+          }`}
         >
-          {isListening ? '🛑 Stop' : '🎤 Start Mic'}
+          {isListening ? '🛑 Stop' : '🎤 Start'}
         </button>
       </div>
 
-      {/* Translated Text Output */}
+      {/* ✅ Translated Text Output */}
       {translated && (
         <div className="mt-6">
           <h3 className="text-lg font-medium text-gray-800 mb-2">🖥️ Translated Text:</h3>
-          <div className="p-3 bg-gray-100 rounded-md border border-gray-300 whitespace-pre-wrap">
+          <div className="p-3 bg-gray-100 rounded-md border shadow-sm">
             {translated}
           </div>
         </div>
       )}
 
-      {/* Control Buttons */}
-      <div className="flex items-center gap-4 mt-4">
+      {/* ✅ Control Buttons */}
+      <div className="flex gap-4 mt-6">
         <button
           onClick={handleClear}
-          className="px-4 py-2 rounded bg-red-500 text-white hover:bg-red-600 transition"
+          className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition"
         >
-          Clear Input
+          Clear
         </button>
         <button
           onClick={() => setIsMuted(!isMuted)}
-          className={`px-4 py-2 rounded ${isMuted ? 'bg-gray-400' : 'bg-green-600 text-white'} hover:opacity-90 transition`}
+          className={`px-4 py-2 rounded transition ${
+            isMuted ? 'bg-gray-400' : 'bg-green-500 text-white hover:bg-green-600'
+          }`}
         >
           {isMuted ? 'Unmute' : 'Mute'}
         </button>
-        <div className="flex items-center">
-          <label className="mr-2 text-gray-600">Volume</label>
+        <div className="flex items-center gap-2">
+          <label className="text-gray-600">Volume</label>
           <input
             type="range"
             min={0}
@@ -359,34 +318,23 @@ export default function TranslationBox() {
             className="w-24"
           />
         </div>
-        <button
-          onClick={() => {
-            if (synthRef.current) {
-              synthRef.current.cancel()
-              ttsQueueRef.current = [] // ✅ Clear the queue
-              console.log('🛑 Speech synthesis reset and queue cleared.')
-            }
-          }}
-          className="px-4 py-2 bg-red-600 text-white rounded"
-        >
-          🛑 Reset Audio
-        </button>
-        <div className="flex flex-col w-1/2 mb-4">
-          <label className="text-gray-600">Choose Voice</label>
-          <select
-            value={selectedVoiceName}
-            onChange={(e) => setSelectedVoiceName(e.target.value)}
-            className="p-2 border rounded"
-          >
-            {synthRef.current &&
-              synthRef.current.getVoices().map((voice) => (
-                <option key={voice.name} value={voice.name}>
-                  {voice.name} ({voice.lang})
-                </option>
-              ))}
-          </select>
-        </div>
+      </div>
 
+      {/* ✅ Voice Selection */}
+      <div className="mt-6">
+        <label className="text-gray-600 mb-2 block">Choose Voice</label>
+        <select
+          value={selectedVoiceName}
+          onChange={(e) => setSelectedVoiceName(e.target.value)}
+          className="p-2 border rounded shadow-sm focus:outline-none w-full"
+        >
+          {synthRef.current &&
+            synthRef.current.getVoices().map((voice) => (
+              <option key={voice.name} value={voice.name}>
+                {voice.name} ({voice.lang})
+              </option>
+            ))}
+        </select>
       </div>
     </div>
   )
