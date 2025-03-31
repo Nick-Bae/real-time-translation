@@ -5,21 +5,21 @@ import os
 
 from app.routes import translate
 
-# Load environment variables from .env file
+# ✅ Load environment variables from .env file
 load_dotenv()
 
 app = FastAPI()
 
-# Enable CORS for all origins (change in production)
+# ✅ Enable CORS for all origins (change in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # ⚠️ Consider restricting this in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include translation route
+# ✅ Include translation route
 app.include_router(translate.router, prefix="/api")
 
 @app.get("/")

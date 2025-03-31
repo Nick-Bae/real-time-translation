@@ -1,19 +1,21 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from app.services.gpt_service import translate_text
+from app.utils.translate import translate_text  # ✅ Import correct translation logic
 
 router = APIRouter()
 
-class TranslationRequest(BaseModel):
-    text: str
-    source: str = "Korean"
-    target: str = "Chinese"
-
 @router.post("/translate")
-async def translate(request: TranslationRequest):
-    try:
-        result = translate_text(request.text, request.source, request.target)
-        return {"translated": result}
-    except Exception as e:
-        print(f"Translation failed: {e}")  # ← Add this line for logging
-        raise HTTPException(status_code=500, detail=str(e))
+async def translate(data: dict):
+    text = data.get("text", "")
+    source = data.get("source", "ko")
+    target = data.get("target", "en")
+
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided for translation")
+
+    # ✅ Perform translation using OpenAI API
+    translation = translate_text(text, source, target)
+
+    if "Translation failed" in translation:
+        raise HTTPException(status_code=500, detail=translation)
+
+    return {"translated": translation}

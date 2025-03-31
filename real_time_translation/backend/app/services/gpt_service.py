@@ -6,6 +6,8 @@ import openai
 from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# openai.api_key = os.getenv("OPENAI_API_KEY")
+
 model = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 def translate_text(text: str, source: str, target: str) -> str:
