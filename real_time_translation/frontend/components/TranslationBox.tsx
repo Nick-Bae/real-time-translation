@@ -25,6 +25,22 @@ export default function TranslationBox() {
   const ttsQueueRef = useRef<string[]>([]) // ✅ Queue for managing TTS playback
   const isSpeakingRef = useRef<boolean>(false) // ✅ Track if TTS is speaking
   const isCancelledRef = useRef<boolean>(false) // ✅ Prevent excessive cancellation
+  const [selectedVoiceName, setSelectedVoiceName] = useState('')
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      synthRef.current = window.speechSynthesis
+
+      // ✅ Wait for voices to load properly
+      setTimeout(() => {
+        const voices = synthRef.current.getVoices()
+        if (voices.length > 0) {
+          setSelectedVoiceName(voices[0].name) // Default to the first voice
+        }
+        console.log('✅ Available Voices:', voices)
+      }, 1000)
+    }
+  }, [])
 
 
   useEffect(() => {
@@ -75,147 +91,149 @@ export default function TranslationBox() {
       handleTranslate(text)
     }
   }, [text])
-  
-// ✅ Enqueue translation for TTS playback
-const enqueueTranslation = (translatedText: string) => {
-  if (!translatedText.trim()) {
-    console.warn('⚠️ Empty or invalid translation. Skipping...')
-    return
-  }
 
-  // ✅ Cancel ongoing speech only if necessary
-  if (synthRef.current.speaking || synthRef.current.pending) {
-    console.warn('🛑 Cancelling previous speech to avoid overlap...')
-    synthRef.current.cancel()
-  }
+  // ✅ Enqueue translation for TTS playback
+  const enqueueTranslation = (translatedText: string) => {
+    if (!translatedText.trim()) {
+      console.warn('⚠️ Empty or invalid translation. Skipping...')
+      return
+    }
 
-  // ✅ Push clean text into the queue
-  ttsQueueRef.current.push(translatedText)
-  console.log('🎧 Enqueuing clean text for speech:', translatedText)
-  if (!isSpeakingRef.current) {
-    playNextInQueue() // ✅ Start playing if no active speech
+    // ✅ Cancel ongoing speech only if necessary
+    if (synthRef.current.speaking || synthRef.current.pending) {
+      console.warn('🛑 Cancelling previous speech to avoid overlap...')
+      synthRef.current.cancel()
+    }
+
+    // ✅ Push clean text into the queue
+    ttsQueueRef.current.push(translatedText)
+    console.log('🎧 Enqueuing clean text for speech:', translatedText)
+    if (!isSpeakingRef.current) {
+      playNextInQueue() // ✅ Start playing if no active speech
+    }
   }
-}
 
   // Handle text translation
-const handleTranslate = async (inputText: string) => {
-  if (!inputText.trim()) return
-  if (isSpeakingRef.current) {
-    console.warn('⚠️ Speech already in progress. Skipping this translation...')
-    return
+  const handleTranslate = async (inputText: string) => {
+    if (!inputText.trim()) return
+    if (isSpeakingRef.current) {
+      console.warn('⚠️ Speech already in progress. Skipping this translation...')
+      return
+    }
+
+    setLoading(true)
+    try {
+      // ✅ Correctly define response before parsing JSON
+      const response = await fetch('http://localhost:8000/api/translate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          text: inputText,
+          source: sourceLang,
+          target: targetLang,
+        }),
+      })
+
+      // ✅ Check if response is OK before parsing
+      if (!response.ok) {
+        throw new Error(`Failed to fetch translation. Status: ${response.status}`)
+      }
+
+      const data = await response.json()
+
+      // ✅ Add debug log to verify API response
+      console.log('API Response:', data)
+
+      // ✅ Corrected translation handling
+      const translation = data.translated || data.translation || 'Translation failed'
+
+      // ✅ Check and clean translation properly
+      let cleanTranslation = translation.replace(/^Translated.*?:\s*/, '').trim()
+
+      // ✅ Log for debugging
+      console.log('✅ Cleaned Translation:', cleanTranslation)
+
+      // ✅ Check if translation is still in Korean (likely untranslated)
+      if (cleanTranslation.match(/[\u3131-\uD79D]/)) {
+        console.warn('⚠️ Translation is still in Korean. Check API or translation logic.')
+        cleanTranslation = 'Translation failed. Please check settings.'
+      }
+
+      // ✅ Set clean translation and update UI
+      setTranslated(cleanTranslation)
+
+      // ✅ Send the correct translated text to TTS
+      if (!isMuted && translation !== 'Translation failed') {
+        enqueueTranslation(cleanTranslation) // ✅ Send clean translation to TTS
+      }
+    } catch (error) {
+      console.error('❌ Error translating:', error)
+      setTranslated('Error during translation')
+    }
+    setLoading(false)
   }
-
-  setLoading(true)
-  try {
-    // ✅ Correctly define response before parsing JSON
-    const response = await fetch('http://localhost:8000/api/translate', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text: inputText,
-        source: sourceLang,
-        target: targetLang,
-      }),
-    })
-
-    // ✅ Check if response is OK before parsing
-    if (!response.ok) {
-      throw new Error(`Failed to fetch translation. Status: ${response.status}`)
-    }
-
-    const data = await response.json()
-
-    // ✅ Add debug log to verify API response
-    console.log('API Response:', data)
-
-    // ✅ Corrected translation handling
-    const translation = data.translated || data.translation || 'Translation failed'
-
-    // ✅ Check and clean translation properly
-    let cleanTranslation = translation.replace(/^Translated.*?:\s*/, '').trim()
-
-    // ✅ Log for debugging
-    console.log('✅ Cleaned Translation:', cleanTranslation)
-
-    // ✅ Check if translation is still in Korean (likely untranslated)
-    if (cleanTranslation.match(/[\u3131-\uD79D]/)) {
-      console.warn('⚠️ Translation is still in Korean. Check API or translation logic.')
-      cleanTranslation = 'Translation failed. Please check settings.'
-    }
-
-    // ✅ Set clean translation and update UI
-    setTranslated(cleanTranslation)
-
-    // ✅ Send the correct translated text to TTS
-    if (!isMuted && translation !== 'Translation failed') {
-      enqueueTranslation(cleanTranslation) // ✅ Send clean translation to TTS
-    }
-  } catch (error) {
-    console.error('❌ Error translating:', error)
-    setTranslated('Error during translation')
-  }
-  setLoading(false)
-}
 
 
   // Play the next sentence in the queue
   // ✅ Play the next sentence in the queue
-const playNextInQueue = () => {
-  if (
-    ttsQueueRef.current.length === 0 ||
-    isMuted ||
-    isSpeakingRef.current ||
-    synthRef.current.speaking ||
-    synthRef.current.pending
-  ) {
-    console.warn('⚠️ Queue empty or speech in progress. Skipping queue play...')
-    isSpeakingRef.current = false
-    return
-  }
+  const playNextInQueue = () => {
+    if (
+      ttsQueueRef.current.length === 0 ||
+      isMuted ||
+      isSpeakingRef.current ||
+      synthRef.current.speaking ||
+      synthRef.current.pending
+    ) {
+      console.warn('⚠️ Queue empty or speech in progress. Skipping queue play...')
+      isSpeakingRef.current = false
+      return
+    }
 
-  const nextText = ttsQueueRef.current.shift()
-  if (nextText && synthRef.current) {
-    setTimeout(() => {
-      // ✅ Cancel ongoing speech before starting new speech
-      if (synthRef.current.speaking) {
-        console.warn('🛑 Cancelling previous speech to avoid overlap...')
-        synthRef.current.cancel()
-      }
-
-      const utterance = new SpeechSynthesisUtterance(nextText)
-      utterance.lang = targetLang
-      utterance.volume = volume
-
-      // ✅ Select appropriate voice for target language
-      const voices = synthRef.current.getVoices()
-      const selectedVoice = voices.find((v) => v.lang.startsWith(targetLang)) || voices[0]
-      utterance.voice = selectedVoice
-
-      console.log('🎙️ Using voice:', selectedVoice.name, 'for language:', targetLang)
-      isSpeakingRef.current = true
-
-      utterance.onend = () => {
-        console.log('✅ Finished speaking:', nextText)
-        isSpeakingRef.current = false
-        if (ttsQueueRef.current.length > 0) {
-          playNextInQueue()
+    const nextText = ttsQueueRef.current.shift()
+    if (nextText && synthRef.current) {
+      setTimeout(() => {
+        if (synthRef.current.speaking) {
+          console.warn('🛑 Cancelling previous speech to avoid overlap...')
+          synthRef.current.cancel()
         }
-      }
 
-      utterance.onerror = (e) => {
-        console.error('❌ Speech synthesis error:', e)
-        isSpeakingRef.current = false
-        if (ttsQueueRef.current.length > 0) {
-          playNextInQueue()
+        const utterance = new SpeechSynthesisUtterance(nextText)
+        utterance.lang = targetLang
+        utterance.volume = volume
+
+        // ✅ Choose a female voice if available
+        const voices = synthRef.current.getVoices()
+        
+          const selectedVoice = voices.find((v) => v.name === selectedVoiceName) || voices[0]
+
+        utterance.voice = selectedVoice
+
+        console.log('🎙️ Using voice:', selectedVoice.name, 'for language:', targetLang)
+
+        isSpeakingRef.current = true
+
+        utterance.onend = () => {
+          console.log('✅ Finished speaking:', nextText)
+          isSpeakingRef.current = false
+          if (ttsQueueRef.current.length > 0) {
+            playNextInQueue()
+          }
         }
-      }
 
-      synthRef.current.speak(utterance)
-    }, 300) // ✅ Small delay to prevent overlap
+        utterance.onerror = (e) => {
+          console.error('❌ Speech synthesis error:', e)
+          isSpeakingRef.current = false
+          if (ttsQueueRef.current.length > 0) {
+            playNextInQueue()
+          }
+        }
+
+        synthRef.current.speak(utterance)
+      }, 300) // ✅ Small delay to prevent overlap
+    }
   }
-}
 
   // Start or stop microphone
   const handleStartListening = () => {
@@ -353,17 +371,22 @@ const playNextInQueue = () => {
         >
           🛑 Reset Audio
         </button>
-        <button
-          onClick={() => {
-            const testUtterance = new SpeechSynthesisUtterance('This is a test to check audio output.')
-            const voices = window.speechSynthesis.getVoices()
-            testUtterance.voice = voices.find((v) => v.lang.startsWith('en')) || voices[0]
-            window.speechSynthesis.speak(testUtterance)
-          }}
-          className="px-4 py-2 bg-green-600 text-white rounded"
-        >
-          🎙️ Test TTS
-        </button>
+        <div className="flex flex-col w-1/2 mb-4">
+          <label className="text-gray-600">Choose Voice</label>
+          <select
+            value={selectedVoiceName}
+            onChange={(e) => setSelectedVoiceName(e.target.value)}
+            className="p-2 border rounded"
+          >
+            {synthRef.current &&
+              synthRef.current.getVoices().map((voice) => (
+                <option key={voice.name} value={voice.name}>
+                  {voice.name} ({voice.lang})
+                </option>
+              ))}
+          </select>
+        </div>
+
       </div>
     </div>
   )
