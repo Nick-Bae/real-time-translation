@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Live Translation Listener</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-100 text-gray-900 dark:bg-gray-900 dark:text-white transition duration-300 ease-in-out">
+
+  <div class="max-w-3xl mx-auto p-6">
+    <!-- Header -->
+    <div class="flex justify-between items-center mb-6">
+      <h1 class="text-2xl font-bold flex items-center gap-2">
+        🎧 Live Translation Listener
+        <span id="statusBadge" class="w-3 h-3 rounded-full bg-gray-400 inline-block" title="WebSocket Status"></span>
+      </h1>
+      <button onclick="toggleTheme()" class="bg-gray-700 hover:bg-gray-600 text-white px-3 py-1 rounded">
+        🌗 Toggle Theme
+      </button>
+    </div>
+
+    <!-- Controls -->
+    <div class="mb-4 flex flex-wrap gap-4 items-center">
+      <button id="start" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded shadow">
+        ▶️ Start Listening
+      </button>
+      <select id="voiceSelect" class="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded px-2 py-1 text-sm">
+        <option disabled selected>Loading voices...</option>
+      </select>
+    </div>
+
+    <!-- Translation Display -->
+    <div id="translationDisplay"
+      class="text-lg p-4 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded shadow min-h-[60px] mb-4">
+      No translation received yet.
+    </div>
+
+    <!-- Log Section -->
+    <div id="log"
+      class="text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded p-3 h-48 overflow-y-auto shadow space-y-1">
+    </div>
+  </div>
+
+  <!-- Script -->
+  <script>
+    let socket;
+    const translationDisplay = document.getElementById('translationDisplay');
+    const log = document.getElementById('log');
+    const statusBadge = document.getElementById('statusBadge');
+    const voiceSelect = document.getElementById('voiceSelect');
+
+    const updateStatus = (state) => {
+      statusBadge.classList.remove("bg-gray-400", "bg-green-500", "bg-red-500");
+      statusBadge.classList.add(
+        state === "connected" ? "bg-green-500" : "bg-red-500"
+      );
+    };
+
+    const unlockTTS = () => {
+      const dummy = new SpeechSynthesisUtterance('');
+      speechSynthesis.speak(dummy);
+      console.log('🔓 TTS unlocked');
+    };
+
+    const speakText = (text) => {
+      if (!text.trim()) return;
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'en';
+
+      const voices = speechSynthesis.getVoices();
+      const selected = voices.find(v => v.name === voiceSelect.value);
+      if (selected) utterance.voice = selected;
+
+      utterance.onerror = (e) => {
+        console.error('❌ TTS Error:', e.error);
+      };
+
+      speechSynthesis.speak(utterance);
+      console.log('🔊 Speaking:', text);
+    };
+
+    document.getElementById('start').onclick = function () {
+      unlockTTS();
+
+      const wsBase = location.hostname === 'localhost'
+        ? 'ws://localhost:8000'
+        : 'ws://10.0.0.17:8000';
+
+      socket = new WebSocket(`${wsBase}/ws/translate`);
+
+      socket.onopen = () => {
+        console.log('🔌 Connected');
+        updateStatus("connected");
+      };
+
+      socket.onmessage = (event) => {
+        let data;
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          console.warn('⚠️ Non-JSON received:', event.data);
+          return;
+        }
+
+        if (data.type === 'translation') {
+          const text = data.payload;
+          translationDisplay.textContent = text;
+          speakText(text);
+
+          const timestamp = new Date().toLocaleTimeString();
+          const logEntry = document.createElement("div");
+          logEntry.textContent = `🕒 ${timestamp}: ${text}`;
+          logEntry.className = "text-gray-500";
+          log.prepend(logEntry);
+        }
+      };
+
+      socket.onerror = (e) => {
+        console.error('❌ WebSocket error:', e);
+        updateStatus("disconnected");
+      };
+
+      socket.onclose = () => {
+        console.log('🔌 Disconnected');
+        updateStatus("disconnected");
+      };
+    };
+
+    window.speechSynthesis.onvoiceschanged = () => {
+      const voices = speechSynthesis.getVoices();
+      voiceSelect.innerHTML = '';
+      voices
+        .filter(voice => voice.lang.startsWith('en'))
+        .forEach(voice => {
+          const option = document.createElement('option');
+          option.value = voice.name;
+          option.textContent = `${voice.name} (${voice.lang})`;
+          voiceSelect.appendChild(option);
+        });
+    };
+
+    const toggleTheme = () => {
+      const root = document.documentElement;
+      const isDark = root.classList.toggle('dark');
+      localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    };
+
+    // Auto-load theme
+    if (localStorage.getItem('theme') === 'dark') {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
+</body>
+
+</html>
