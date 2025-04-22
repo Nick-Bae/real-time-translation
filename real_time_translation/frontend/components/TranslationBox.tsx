@@ -13,7 +13,7 @@ const availableLanguages = [
 
 export default function TranslationBox() {
   // 🔌 WebSocket and status
-  const { translationSocketRef} = useTranslationSocket()
+  const { translationSocketRef } = useTranslationSocket()
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
@@ -79,13 +79,11 @@ export default function TranslationBox() {
   }, []);
 
   const throttledSend = useRef(
-    throttle((message: string) => {
+    throttle((message: any) => {
       const socket = translationSocketRef.current;
       if (socket?.readyState === WebSocket.OPEN) {
         const payload = JSON.stringify({
-          type: "translation",
-          payload: message,
-          lang: targetLang,
+          ...message,
           timestamp: new Date().toISOString(),
         });
         socket.send(payload);
@@ -93,9 +91,8 @@ export default function TranslationBox() {
       } else {
         console.warn('⚠️ WebSocket not ready. Broadcast skipped.');
       }
-    }, 800) // 800ms throttle delay
+    }, 800)
   ).current;
-
 
   const handleTranslate = async (inputText: string) => {
     console.log('🔄 handleTranslate called with:', inputText);
@@ -109,6 +106,7 @@ export default function TranslationBox() {
     lastTranslatedRef.current = inputText;
 
     setLoading(true);
+    console.log("🔍 API Base URL:", process.env.NEXT_PUBLIC_API_BASE_URL);
 
     try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/api/translate`, {
@@ -140,11 +138,12 @@ export default function TranslationBox() {
         enqueueTranslation(cleanTranslation);
 
         // ✅ Structured broadcast via throttled WebSocket
-        throttledSend(JSON.stringify({
+        throttledSend({
           type: 'translation',
           payload: cleanTranslation,
           lang: targetLang,
-        }));
+        });
+
       }
 
     } catch (error) {
@@ -155,6 +154,10 @@ export default function TranslationBox() {
     setLoading(false);
   };
 
+
+  const throttledHandleTranslate = useRef(
+    throttle(handleTranslate, 1000)
+  ).current
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -209,37 +212,49 @@ export default function TranslationBox() {
 
         // Append only the new content
         if (newContent.trim()) {
-          sentenceBufferRef.current += newContent
-          setText(sentenceBufferRef.current.trim())
+          const overlapThreshold = 5;
+          const newLength = newContent.length;
 
-          // Smart sentence-ending pattern with polite endings
+          if (newLength > 0) {
+            const bufferTail = sentenceBufferRef.current.slice(-newLength - overlapThreshold);
+            const isRealNew = !bufferTail.includes(newContent);
+
+            if (isRealNew) {
+              sentenceBufferRef.current += newContent;
+            }
+          }
+
+          setText(sentenceBufferRef.current.trim());
+
           const endings = [
             '습니다', '니까', '어요', '에요', '예요', '지요', '죠', '했어', '했지',
             '했네', '했네요', '하자', '한다', '했거든', '하거든', '해요', '해',
-            '했니', '입니다', '말합니다', '전합니다', '알립니다', '가르칩니다', '합니다'
-          ]
+            '했니', '입니다', '말합니다', '전합니다', '알립니다', '가르칩니다', '합니다',
+            '할까요'
+          ];
 
           const sentenceEndRegex = new RegExp(
-            `([가-힣\\s“”"‘’']*?(?:${endings.join('|')})(?:[.!?。！？]?)(?=\\s|\\n|$))`,
+            `([가-힣\\w\\s“”"‘’']{3,}?(?:${endings.join('|')})(?:[.!?。！？]?)(?=\\s|\\n|$))`,
             'g'
-          )
+          );
 
-
-          // Inside your recognition.onresult or wherever needed
-          const matches = sentenceBufferRef.current.match(sentenceEndRegex)
-          console.log('✅ Detected full sentences:', matches)
+          const matches = sentenceBufferRef.current.match(sentenceEndRegex);
+          console.log('✅ Detected full sentences:', matches);
 
           if (matches && matches.length > 0) {
             matches.forEach((sentence) => {
-              const cleaned = sentence.trim()
+              const cleaned = sentence.trim();
               if (cleaned.length > 3) {
-                console.log('📤 Sending for translation:', cleaned)
-                handleTranslate(cleaned)
+                console.log('📤 Sending for translation:', cleaned);
+                throttledHandleTranslate(cleaned);
               }
-            })
+            });
 
-            // Remove processed parts
-            sentenceBufferRef.current = sentenceBufferRef.current.replace(sentenceEndRegex, '')
+            sentenceBufferRef.current = sentenceBufferRef.current.replace(sentenceEndRegex, '');
+          }
+
+          if (sentenceBufferRef.current.length > 300 && !matches?.length) {
+            sentenceBufferRef.current = sentenceBufferRef.current.slice(-100);
           }
         }
       }
@@ -312,11 +327,20 @@ export default function TranslationBox() {
     console.log('🗣️ Speaking:', nextText)
 
     utterance.onend = () => {
-      isSpeakingRef.current = false
+      isSpeakingRef.current = false;
+
+      // 🔁 Resume microphone recognition if applicable
+      if (recognitionRef.current && isListening && !pauseListening) {
+        recognitionRef.current.start();
+        console.log('🎙️ Resumed speech recognition after TTS.');
+      }
+
+      // ▶️ Continue playing the next sentence
       if (ttsQueueRef.current.length > 0) {
-        setTimeout(() => playNextInQueue(), 300) // Small delay to breathe
+        setTimeout(() => playNextInQueue(), 300); // Small delay to breathe
       }
     }
+
 
     utterance.onerror = (e) => {
       console.error('❌ Speech error:', e)
@@ -326,7 +350,12 @@ export default function TranslationBox() {
       }
     }
 
-    synthRef.current.speak(utterance)
+    // 🔇 Temporarily pause recognition while speaking
+    if (recognitionRef.current && isListening) {
+      recognitionRef.current.stop();
+    }
+
+    synthRef.current.speak(utterance);
   }
 
 
