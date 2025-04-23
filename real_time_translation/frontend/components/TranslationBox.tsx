@@ -31,32 +31,58 @@ export default function TranslationBox() {
   const isSpeakingRef = useRef<boolean>(false) // ✅ Track if TTS is speaking
   const isCancelledRef = useRef<boolean>(false) // ✅ Prevent excessive cancellation
   const sentenceBufferRef = useRef<string>('');
-
+  
   // ✅ Handle text translation
   const lastTranslatedRef = useRef<string>('') // ⬅️ Define this at the top level of your component
 
   useEffect(() => {
-    const socket = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
-    translationSocketRef.current = socket;
-
-    socket.onopen = () => {
-      console.log('✅ WebSocket connected');
-      setSocketStatus('connected');
+    let socket: WebSocket;
+    let reconnectAttempts = 0;
+    const maxReconnectAttempts = 10;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let manuallyStopped = false;
+  
+    const connectWebSocket = () => {
+      if (manuallyStopped) {
+        console.log("🛑 Reconnect aborted by manual stop.");
+        return;
+      }
+  
+      socket = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
+      translationSocketRef.current = socket;
+  
+      socket.onopen = () => {
+        console.log('✅ WebSocket connected');
+        setSocketStatus('connected');
+        reconnectAttempts = 0;
+      };
+  
+      socket.onclose = () => {
+        console.log('🔌 WebSocket disconnected');
+        setSocketStatus('disconnected');
+        if (!manuallyStopped && reconnectAttempts < maxReconnectAttempts) {
+          reconnectAttempts++;
+          const delay = reconnectAttempts * 1000;
+          console.log(`🔁 Reconnecting in ${delay / 1000}s...`);
+          reconnectTimeout = setTimeout(connectWebSocket, delay);
+        }
+      };
+  
+      socket.onerror = (e) => {
+        console.error('⚠️ WebSocket error:', e);
+        setSocketStatus('disconnected');
+      };
     };
-
-    socket.onclose = () => {
-      console.warn('❌ WebSocket disconnected');
-      setSocketStatus('disconnected');
+  
+    connectWebSocket();
+  
+    // Manual disconnect (for Stop Listening)
+    return () => {
+      manuallyStopped = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      socket?.close();
     };
-
-    socket.onerror = (e) => {
-      console.error('⚠️ WebSocket error', e);
-      setSocketStatus('disconnected');
-    };
-
-    return () => socket.close();
   }, []);
-
 
   useEffect(() => {
     translationSocketRef.current = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
@@ -376,10 +402,18 @@ export default function TranslationBox() {
 
   const handleStopListening = () => {
     if (recognitionRef.current) {
-      recognitionRef.current.stop()
-      setIsListening(false)
+      recognitionRef.current.stop();
+      setIsListening(false);
     }
-  }
+  
+    const socket = translationSocketRef.current;
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.close();
+      translationSocketRef.current = null;
+      setSocketStatus('disconnected');
+      console.log("🛑 Manually stopped WebSocket.");
+    }
+  };
 
   // ✅ Clear input, reset and stop TTS
   const handleClear = () => {
