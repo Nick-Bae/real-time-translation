@@ -1,4 +1,4 @@
-#!/home/namju/project/real_time_translation/backend/venv/bin/python3
+#!/Users/namju/project/real-time-translation/real_time_translation/backend/venv/bin/python3.13
 # -*- coding: utf-8 -*-
 import re
 import sys

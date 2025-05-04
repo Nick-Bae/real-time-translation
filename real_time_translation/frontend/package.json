@@ -3,16 +3,17 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
+    "backend": "node utils/detectBackend.js",
+    "dev": "next dev -H 0.0.0.0 -p 3000",
+    "dev-all": "concurrently -k -n BACKEND,FRONTEND \"npm:backend\" \"npm:dev\" && npm run check",
+    "check": "node utils/check-status.js"
   },
   "dependencies": {
     "axios": "^1.8.4",
     "next": "15.2.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "ws": "^8.18.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
@@ -20,6 +21,7 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "concurrently": "^9.1.2",
     "eslint": "^9",
     "eslint-config-next": "15.2.4",
     "tailwindcss": "^4",

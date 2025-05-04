@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
+import { WS_URL } from '../utils/urls'
 
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
@@ -36,7 +37,7 @@ export default function TranslationBox() {
   const lastTranslatedRef = useRef<string>('') // ⬅️ Define this at the top level of your component
 
   useEffect(() => {
-    const socket = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
+    const socket = new WebSocket(`${WS_URL}/ws/translate`);
     translationSocketRef.current = socket;
 
     socket.onopen = () => {
@@ -59,7 +60,7 @@ export default function TranslationBox() {
 
 
   useEffect(() => {
-    translationSocketRef.current = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
+    translationSocketRef.current = new WebSocket(`${WS_URL}/ws/translate`);
 
     translationSocketRef.current.onopen = () => {
       console.log('✅ WebSocket connected');
