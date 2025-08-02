@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException
-from app.utils.translate import translate_text  # ✅ Import correct translation logic
+from app.utils.translate import translate_text
+from app.socket_manager import manager  # ✅ Import the connection manager
 
 router = APIRouter()
 
@@ -12,10 +13,16 @@ async def translate(data: dict):
     if not text:
         raise HTTPException(status_code=400, detail="No text provided for translation")
 
-    # ✅ Perform translation using OpenAI API
     translation = translate_text(text, source, target)
 
     if "Translation failed" in translation:
         raise HTTPException(status_code=500, detail=translation)
+
+    # ✅ WebSocket broadcast here!
+    await manager.broadcast({
+        "type": "translation",
+        "payload": translation,
+        "lang": target
+    })
 
     return {"translated": translation}
