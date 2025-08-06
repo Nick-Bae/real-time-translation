@@ -1,4 +1,4 @@
-import os
+import os, json
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from app.routes import translate
 from typing import List
 from app.socket_manager import manager
-from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
@@ -16,16 +15,26 @@ origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 app.include_router(translate.router, prefix="/api")
 
 @app.get("/")
 def read_root():
     return {"message": "Server is live"}
+
+# This endpoint is not necessary if you're using broadcast flow
+# You can comment/remove this:
+# @app.websocket("/ws")
+# async def websocket_endpoint(websocket: WebSocket):
+#     await websocket.accept()
+#     while True:
+#         data = await websocket.receive_text()
+#         await websocket.send_text(json.dumps(f"Received: {data}"))
 
 @app.websocket("/ws/translate")
 async def websocket_endpoint(websocket: WebSocket):
@@ -34,7 +43,7 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             await asyncio.sleep(1)  # Passive loop to keep connection alive
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        await manager.disconnect(websocket)
         print("❌ Listener disconnected")
 
 @app.post("/api/broadcast")
