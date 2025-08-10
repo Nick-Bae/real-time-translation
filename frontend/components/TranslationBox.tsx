@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
-import { WS_URL } from '../utils/urls'
+import { useSentenceBuffer } from '../utils/useSentenceBuffer';
 
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
@@ -13,8 +13,10 @@ const availableLanguages = [
 ]
 
 export default function TranslationBox() {
-  // 🔌 WebSocket and status
-  const { translationSocketRef } = useTranslationSocket()
+  // 🔌 WebSocket (producer mode)
+  const { connected, last, sendProducerText } = useTranslationSocket({ isProducer: true })
+
+  // UI states
   const [text, setText] = useState('')
   const [translated, setTranslated] = useState('')
   const [isListening, setIsListening] = useState(false)
@@ -25,430 +27,371 @@ export default function TranslationBox() {
   const [volume, setVolume] = useState(1)
   const [pauseListening, setPauseListening] = useState(false)
   const [selectedVoiceName, setSelectedVoiceName] = useState('')
-  const [socketStatus, setSocketStatus] = useState<'connected' | 'disconnected'>('disconnected');
+
+  // Refs
   const synthRef = useRef<any>(null)
   const recognitionRef = useRef<any>(null)
-  const ttsQueueRef = useRef<string[]>([]) // ✅ Queue for managing TTS playback
-  const isSpeakingRef = useRef<boolean>(false) // ✅ Track if TTS is speaking
-  const isCancelledRef = useRef<boolean>(false) // ✅ Prevent excessive cancellation
-  const sentenceBufferRef = useRef<string>('');
-  
-  // ✅ Handle text translation
-  const lastTranslatedRef = useRef<string>('') // ⬅️ Define this at the top level of your component
+  const ttsQueueRef = useRef<string[]>([])
+  const isSpeakingRef = useRef<boolean>(false)
+  const lastSentRef = useRef<string>('') // prevent duplicates to WS
+  const wantListeningRef = useRef(false);
+  const recActiveRef = useRef(false);
+  const restartTimerRef = useRef<number | null>(null);
+  const idleTimerRef = useRef<number | null>(null);
+  const lastInterimRef = useRef('');
+  const segmentCounterRef = useRef(0);
+  const currentSegmentRef = useRef<number | null>(null);
+  const revRef = useRef(0);
 
-  useEffect(() => {
-    let socket: WebSocket;
-    let reconnectAttempts = 0;
-    const maxReconnectAttempts = 10;
-    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-    let manuallyStopped = false;
-  
-    const connectWebSocket = () => {
-      if (manuallyStopped) {
-        console.log("🛑 Reconnect aborted by manual stop.");
-        return;
-      }
-  
-      socket = new WebSocket(`${process.env.NEXT_PUBLIC_WS_URL}/ws/translate`);
-      translationSocketRef.current = socket;
-  
-      socket.onopen = () => {
-        console.log('✅ WebSocket connected');
-        setSocketStatus('connected');
-        reconnectAttempts = 0;
-      };
-  
-      socket.onclose = () => {
-        console.log('🔌 WebSocket disconnected');
-        setSocketStatus('disconnected');
-        if (!manuallyStopped && reconnectAttempts < maxReconnectAttempts) {
-          reconnectAttempts++;
-          const delay = reconnectAttempts * 1000;
-          console.log(`🔁 Reconnecting in ${delay / 1000}s...`);
-          reconnectTimeout = setTimeout(connectWebSocket, delay);
-        }
-      };
-  
-      socket.onerror = (e) => {
-        console.error('⚠️ WebSocket error:', e);
-        setSocketStatus('disconnected');
-      };
-    };
-  
-    connectWebSocket();
-  
-    // Manual disconnect (for Stop Listening)
-    return () => {
-      manuallyStopped = true;
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      socket?.close();
-    };
-  }, []);
-
-  useEffect(() => {
-    translationSocketRef.current = new WebSocket(`${WS_URL}/ws/translate`);
-
-    translationSocketRef.current.onopen = () => {
-      console.log('✅ WebSocket connected');
-    };
-
-    translationSocketRef.current.onclose = () => {
-      console.log('❌ WebSocket closed');
-    };
-
-    translationSocketRef.current.onerror = (e) => {
-      console.error('❗ WebSocket error', e);
-    };
-
-    return () => {
-      translationSocketRef.current?.close();
-    };
-  }, []);
-
-  const throttledSend = useRef(
-    throttle((message: any) => {
-      const socket = translationSocketRef.current;
-      if (socket?.readyState === WebSocket.OPEN) {
-        const payload = JSON.stringify({
-          ...message,
-          timestamp: new Date().toISOString(),
-        });
-        socket.send(payload);
-        console.log('📤 Sent structured message:', payload);
-      } else {
-        console.warn('⚠️ WebSocket not ready. Broadcast skipped.');
-      }
-    }, 800)
-  ).current;
-
-  const handleTranslate = async (inputText: string) => {
-    console.log('🔄 handleTranslate called with:', inputText);
-
-    if (!inputText.trim()) return;
-
-    if (inputText === lastTranslatedRef.current) {
-      console.log('🛑 Skipping duplicate sentence:', inputText);
-      return;
+  const mapToLocale = (code: string) => {
+    switch (code) {
+      case 'ko': return 'ko-KR';
+      case 'en': return 'en-US';
+      case 'zh-CN': return 'zh-CN';
+      case 'es': return 'es-ES';
+      default: return code; // fall back if already a locale
     }
-    lastTranslatedRef.current = inputText;
+  };
+  const MIN_DELTA_CHARS = 2;          // ignore tiny deltas like “은”, “요”
+  const NEW_UTTERANCE_DROP = 0.6;     // treat big shrink as a new utterance
+  const IDLE_MS = 12000; // silence window before auto-stop (tweak as you like)
 
-    setLoading(true);
-    console.log("🔍 API Base URL:", process.env.NEXT_PUBLIC_API_BASE_URL);
-
-    try {
-      const response = await fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/api/translate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: inputText,
-          source: sourceLang,
-          target: targetLang,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Failed to fetch translation. Status: ${response.status}`);
-      }
-
-      const data = await response.json();
-      const translation = data.translated || 'Translation failed';
-
-      let cleanTranslation = translation.replace(/^Translated.*?:\s*/, '').trim();
-
-      if (cleanTranslation.match(/[\u3131-\uD79D]/)) {
-        cleanTranslation = 'Translation failed. Please check settings.';
-      }
-
-      setTranslated(cleanTranslation);
-
-      if (!isMuted && cleanTranslation !== 'Translation failed') {
-        enqueueTranslation(cleanTranslation);
-
-        // ✅ Structured broadcast via throttled WebSocket
-        throttledSend({
-          type: 'translation',
-          payload: cleanTranslation,
-          lang: targetLang,
-        });
-
-      }
-
-    } catch (error) {
-      console.error('❌ Error translating:', error);
-      setTranslated('Error during translation');
-    }
-
-    setLoading(false);
+  const startRecognition = () => {
+    wantListeningRef.current = true;
+    if (!recognitionRef.current || recActiveRef.current) return;
+    try { recognitionRef.current.start(); } catch { }
   };
 
+  const scheduleRestart = (delayMs = 300) => {
+    if (restartTimerRef.current) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+    restartTimerRef.current = window.setTimeout(() => {
+      if (wantListeningRef.current && !recActiveRef.current && recognitionRef.current) {
+        try { recognitionRef.current.start(); } catch { }
+      }
+    }, delayMs);
+  };
 
-  const throttledHandleTranslate = useRef(
-    throttle(handleTranslate, 1000)
-  ).current
+  const resetIdleTimer = () => {
+    if (idleTimerRef.current) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+    idleTimerRef.current = window.setTimeout(() => {
+      // Auto-stop after silence
+      wantListeningRef.current = false;
+      try { recognitionRef.current?.stop(); } catch { }
+      setIsListening(false); // flip button to Start
+    }, IDLE_MS);
+  };
 
+  // Soft stop that preserves "intent" when keepIntent=true (use for TTS pause)
+  const stopRecognition = (keepIntent = false) => {
+    if (!keepIntent) wantListeningRef.current = false;
+    try { recognitionRef.current?.stop(); } catch { }
+  };
+
+  // ✅ When server broadcasts a new translation (Prepared/Live), update UI + TTS
+  useEffect(() => {
+    const incoming = (last?.text || '').trim()
+    if (!incoming) return
+
+    setTranslated(incoming)
+
+    if (!isMuted && incoming !== 'Translation failed') {
+      enqueueTranslation(incoming)
+    }
+  }, [last.text]) // runs when server broadcast (or direct reply) changes
+
+  // ✅ Throttled sender to WS (avoid spamming)
+  const sendSentence = useCallback((sentence: string) => {
+    const s = sentence.trim()
+    if (!s) return
+    if (s === lastSentRef.current) return
+    lastSentRef.current = s
+    // Let backend choose Prepared vs Live and broadcast back
+    sendProducerText(s, sourceLang, targetLang)
+  }, [sendProducerText, sourceLang, targetLang])
+
+  const throttledSendSentence = useRef(throttle(sendSentence, 800)).current
+
+  // ✅ Sentence buffer: flushes on punctuation or silence
+  const buffer = useSentenceBuffer((sentence) => {
+    // final commit for this segment
+    if (currentSegmentRef.current === null) {
+      currentSegmentRef.current = ++segmentCounterRef.current;
+      revRef.current = 0;
+    }
+    sendProducerText(sentence, sourceLang, targetLang, /* partial */ false, currentSegmentRef.current, ++revRef.current);
+
+    // reset segment so the next sentence gets a new id
+    currentSegmentRef.current = null;
+    revRef.current = 0;
+
+    setText(''); // clear interim box on commit
+  }, { timeoutMs: 1500, minLength: 4 });
+
+
+  // 🧠 Speech Synthesis init
   useEffect(() => {
     if (typeof window === 'undefined') return
-
-    // Initialize Speech Synthesis
     synthRef.current = window.speechSynthesis
 
     const loadVoices = () => {
       const voices = synthRef.current.getVoices()
-      if (voices.length > 0) {
+      if (voices?.length) {
         setSelectedVoiceName(voices[0].name)
-        console.log('✅ Available Voices:', voices)
       } else {
-        // Retry once voices are loaded asynchronously
         window.speechSynthesis.onvoiceschanged = () => {
-          const updatedVoices = synthRef.current.getVoices()
-          setSelectedVoiceName(updatedVoices[0]?.name || '')
-          console.log('✅ Voices loaded later:', updatedVoices)
+          const updated = synthRef.current.getVoices()
+          setSelectedVoiceName(updated[0]?.name || '')
         }
       }
     }
-
     loadVoices()
+  }, [])
 
-    // Initialize Speech Recognition
-    if ('webkitSpeechRecognition' in window) {
-      const recognition = new (window as any).webkitSpeechRecognition()
-      recognition.lang = sourceLang
-      recognition.continuous = true
-      recognition.interimResults = true
+  // ====== Your robust recognition effect ======
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!('webkitSpeechRecognition' in window)) return;
 
-      let lastTranscript = '' // store previous transcript
+    const recognition = new (window as any).webkitSpeechRecognition();
+    recognition.lang = mapToLocale(sourceLang);
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
 
-      recognition.onresult = (event: any) => {
-        let interimTranscript = ''
-        console.log('🧠 onresult fired')
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          const result = event.results[i]
-          interimTranscript += result[0].transcript
+    recognition.onstart = () => {
+      recActiveRef.current = true;
+      wantListeningRef.current = true; // we initiated it
+      setIsListening(true);            // keep button on Stop
+      resetIdleTimer();
+    };
+
+    recognition.onend = () => {
+      recActiveRef.current = false;
+      if (wantListeningRef.current && !pauseListening) {
+        // normal recycle → keep Stop button, restart soon
+        setIsListening(true);
+        scheduleRestart(250);
+      } else {
+        // truly stopped (manual/idle)
+        setIsListening(false);
+      }
+    };
+
+    recognition.onerror = (e: any) => {
+      const err = e?.error;
+      // benign errors → soft recover
+      if (err === 'no-speech' || err === 'audio-capture' || err === 'network' || err === 'aborted') {
+        recActiveRef.current = false;
+        if (wantListeningRef.current && !pauseListening) {
+          setIsListening(true);  // keep Stop
+          scheduleRestart(400);
         }
+        return;
+      }
+      // permission denied etc.
+      console.warn('SpeechRecognition error:', err || e);
+    };
 
-        // Remove overlap with previous transcript
-        let newContent = interimTranscript
-        console.log('📝 New content:', newContent)
+    recognition.onresult = (event: any) => {
+      // Build cumulative interim
+      let interimTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const r = event.results[i];
+        interimTranscript += r[0].transcript;
+      }
+      const trimmed = interimTranscript.trim();
+      if (!trimmed) return;
 
-        if (lastTranscript && interimTranscript.startsWith(lastTranscript)) {
-          newContent = interimTranscript.substring(lastTranscript.length)
-        }
+      // Reset idle timer on any speech
+      resetIdleTimer();
 
-        // Update for next comparison
-        lastTranscript = interimTranscript
-
-        // Append only the new content
-        if (newContent.trim()) {
-          const overlapThreshold = 5;
-          const newLength = newContent.length;
-
-          if (newLength > 0) {
-            const bufferTail = sentenceBufferRef.current.slice(-newLength - overlapThreshold);
-            const isRealNew = !bufferTail.includes(newContent);
-
-            if (isRealNew) {
-              sentenceBufferRef.current += newContent;
-            }
-          }
-
-          setText(sentenceBufferRef.current.trim());
-
-          const endings = [
-            '습니다', '니까', '어요', '에요', '예요', '지요', '죠', '했어', '했지',
-            '했네', '했네요', '하자', '한다', '했거든', '하거든', '해요', '해',
-            '했니', '입니다', '말합니다', '전합니다', '알립니다', '가르칩니다', '합니다',
-            '할까요'
-          ];
-
-          const sentenceEndRegex = new RegExp(
-            `([가-힣\\w\\s“”"‘’']{3,}?(?:${endings.join('|')})(?:[.!?。！？]?)(?=\\s|\\n|$))`,
-            'g'
-          );
-
-          const matches = sentenceBufferRef.current.match(sentenceEndRegex);
-          console.log('✅ Detected full sentences:', matches);
-
-          if (matches && matches.length > 0) {
-            matches.forEach((sentence) => {
-              const cleaned = sentence.trim();
-              if (cleaned.length > 3) {
-                console.log('📤 Sending for translation:', cleaned);
-                throttledHandleTranslate(cleaned);
-              }
-            });
-
-            sentenceBufferRef.current = sentenceBufferRef.current.replace(sentenceEndRegex, '');
-          }
-
-          if (sentenceBufferRef.current.length > 300 && !matches?.length) {
-            sentenceBufferRef.current = sentenceBufferRef.current.slice(-100);
-          }
-        }
+      // Compute delta vs last interim
+      let prev = lastInterimRef.current || '';
+      // If Chrome shrinks a lot (new utterance), reset baseline
+      if (prev && !prev.startsWith(trimmed) && trimmed.length < prev.length * NEW_UTTERANCE_DROP) {
+        prev = '';
       }
 
-      recognition.onend = () => {
-        if (isListening && !pauseListening) {
-          recognition.start()
-        } else {
-          setIsListening(false)
-        }
+      let newPart = '';
+      if (trimmed.startsWith(prev)) {
+        newPart = trimmed.slice(prev.length);          // normal growth → tail
+      } else if (prev.startsWith(trimmed)) {
+        newPart = '';                                  // rare shrink → no delta
+      } else {
+        newPart = trimmed;                              // big jump → take full
       }
 
-      recognitionRef.current = recognition
+      // Ignore tiny deltas (do NOT advance baseline if we skip)
+      const nonSpaceDeltaLen = newPart.replace(/\s+/g, '').length;
+      if (nonSpaceDeltaLen < MIN_DELTA_CHARS) {
+        setText(trimmed); // show smooth interim
+        return;
+      }
+
+      // Accept delta → advance baseline & feed buffer
+      lastInterimRef.current = trimmed;
+      buffer.add(newPart);
+      setText(trimmed);
+    };
+
+    recognitionRef.current = recognition;
+
+    // If UI says we should be listening (e.g., toggled Start), kick off start
+    if (isListening && !recActiveRef.current) {
+      try { recognition.start(); } catch { }
     }
 
-  }, [sourceLang, pauseListening])
-
-
+    return () => {
+      try { recognition.stop(); } catch { }
+      recActiveRef.current = false;
+      wantListeningRef.current = false;
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
+    };
+  }, [sourceLang, pauseListening, buffer, isListening]);
 
 
   // ✅ Enqueue translation for TTS playback
   const enqueueTranslation = (translatedText: string) => {
-    if (!translatedText.trim()) {
-      console.warn('⚠️ Empty or invalid translation. Skipping...')
+    if (!translatedText.trim()) return
+    // Dedup queue to avoid echoes
+    if (ttsQueueRef.current.length && ttsQueueRef.current[ttsQueueRef.current.length - 1] === translatedText) {
       return
     }
-
-    // Prevent duplicate enqueue
-    if (ttsQueueRef.current.includes(translatedText)) {
-      console.log('⛔ Duplicate translation skipped:', translatedText)
-      return
-    }
-
-    // If speech in progress, wait for queue
     if (synthRef.current.speaking || isSpeakingRef.current) {
-      console.log('🔁 TTS busy. Queueing:', translatedText)
       ttsQueueRef.current.push(translatedText)
       return
     }
-
-    // Add to queue and play
     ttsQueueRef.current.push(translatedText)
     playNextInQueue()
   }
 
-
-  // ✅ Play the next sentence in the queue
+  // ✅ Play next TTS item
   const playNextInQueue = () => {
     if (
       ttsQueueRef.current.length === 0 ||
       isMuted ||
       isSpeakingRef.current ||
       synthRef.current.speaking
-    ) {
-      return
+    ) return;
+
+    const nextText = ttsQueueRef.current.shift();
+    if (!nextText) return;
+
+    const utter = new SpeechSynthesisUtterance(nextText);
+    utter.lang = targetLang;
+    utter.volume = volume;
+
+    const voices = synthRef.current.getVoices();
+    const sel = voices.find((v: SpeechSynthesisVoice) => v.name === selectedVoiceName) || voices[0];
+    utter.voice = sel;
+
+    isSpeakingRef.current = true;
+
+    // 🔇 Pause mic during TTS, but keep UI button on Stop
+    if (recognitionRef.current && isListening) {
+      stopRecognition(true);       // helper sets wantListeningRef=false and stops cleanly
+      setIsListening(true);    // keep button showing Stop during TTS
     }
 
-    const nextText = ttsQueueRef.current.shift()
-    if (!nextText) return
-
-    const utterance = new SpeechSynthesisUtterance(nextText)
-    utterance.lang = targetLang
-    utterance.volume = volume
-
-    const voices = synthRef.current.getVoices()
-    const selectedVoice = voices.find((v) => v.name === selectedVoiceName) || voices[0]
-    utterance.voice = selectedVoice
-
-    isSpeakingRef.current = true
-    console.log('🗣️ Speaking:', nextText)
-
-    utterance.onend = () => {
+    utter.onend = () => {
       isSpeakingRef.current = false;
 
-      // 🔁 Resume microphone recognition if applicable
-      if (recognitionRef.current && isListening && !pauseListening) {
-        recognitionRef.current.start();
-        console.log('🎙️ Resumed speech recognition after TTS.');
+      // ▶️ Resume mic after TTS if user still wants to listen
+      if (!pauseListening) {
+        wantListeningRef.current = true; // user intent to keep listening
+        scheduleRestart(300);            // gentle restart delay
+        setIsListening(true);            // keep button on Stop
+        resetIdleTimer();                // reset silence window
       }
 
-      // ▶️ Continue playing the next sentence
+      // Continue queued items
       if (ttsQueueRef.current.length > 0) {
-        setTimeout(() => playNextInQueue(), 300); // Small delay to breathe
+        setTimeout(() => playNextInQueue(), 300);
       }
-    }
+    };
 
+    utter.onerror = () => {
+      isSpeakingRef.current = false;
 
-    utterance.onerror = (e) => {
-      console.error('❌ Speech error:', e)
-      isSpeakingRef.current = false
+      if (!pauseListening) {
+        wantListeningRef.current = true;
+        scheduleRestart(300);
+        setIsListening(true);
+        resetIdleTimer();
+      }
+
       if (ttsQueueRef.current.length > 0) {
-        setTimeout(() => playNextInQueue(), 300)
+        setTimeout(() => playNextInQueue(), 300);
       }
-    }
+    };
 
-    // 🔇 Temporarily pause recognition while speaking
-    if (recognitionRef.current && isListening) {
-      recognitionRef.current.stop();
-    }
-
-    synthRef.current.speak(utterance);
-  }
-
-
-  // ✅ Start or stop microphone
-  const handleStartListening = () => {
-    if (recognitionRef.current) {
-      setText('')
-      setTranslated('')
-      ttsQueueRef.current = []
-      synthRef.current.cancel()
-      isSpeakingRef.current = false
-      recognitionRef.current.start()
-      setIsListening(true)
-    } else {
-      alert('Speech recognition is not supported in this browser.')
-    }
-  }
-
-  const handleStopListening = () => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    }
-  
-    const socket = translationSocketRef.current;
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.close();
-      translationSocketRef.current = null;
-      setSocketStatus('disconnected');
-      console.log("🛑 Manually stopped WebSocket.");
-    }
+    synthRef.current.speak(utter);
   };
 
-  // ✅ Clear input, reset and stop TTS
+
+  // ====== When you press Start/Stop, use these ======
+  const handleStartListening = () => {
+    if (!recognitionRef.current) {
+      alert('Speech recognition is not supported in this browser.');
+      return;
+    }
+    lastInterimRef.current = '';      // reset baseline each session
+    setText('');
+    setTranslated('');
+    ttsQueueRef.current = [];
+    synthRef.current?.cancel();
+    isSpeakingRef.current = false;
+
+    wantListeningRef.current = true;
+    setIsListening(true);             // button → Stop
+    try { recognitionRef.current.start(); } catch { }
+  };
+
+  const handleStopListening = () => {
+    stopRecognition(false);           // hard stop (clear intent)
+    setIsListening(false);            // button → Start
+  };
+
+  // 🧽 Clear
   const handleClear = () => {
     setText('')
     setTranslated('')
     handleStopListening()
-    if (synthRef.current) {
-      synthRef.current.cancel()
-    }
+    synthRef.current?.cancel()
     ttsQueueRef.current = []
+    isSpeakingRef.current = false
   }
 
   return (
     <div className="w-full max-w-3xl mx-auto p-6 bg-white rounded-xl shadow-md">
-      {/* ✅ Header Section */}
+      {/* Header */}
       <h2 className="text-2xl font-bold text-gray-700 mb-4 text-center">🎤 Real-Time Translator</h2>
       <div className="flex items-center mb-4 gap-2">
         <span
-          className={`inline-block w-3 h-3 rounded-full ${socketStatus === 'connected' ? 'bg-green-500' : 'bg-red-500'}`}
-          title={socketStatus === 'connected' ? 'Connected' : 'Disconnected'}
-        ></span>
+          className={`inline-block w-3 h-3 rounded-full ${connected ? 'bg-green-500' : 'bg-red-500'}`}
+          title={connected ? 'Connected' : 'Disconnected'}
+        />
         <span className="text-sm text-gray-600">
-          WebSocket: {socketStatus === 'connected' ? 'Connected' : 'Disconnected'}
+          WebSocket: {connected ? 'Connected' : 'Disconnected'} {last.mode ? `· ${last.mode}` : ''}
+          {last.mode === 'pre' ? ` (score ${last.matchScore.toFixed(2)})` : ''}
         </span>
       </div>
 
-      {/* ✅ Status Bar */}
+      {/* Status */}
       {loading && (
         <div className="mb-4 text-blue-500 text-sm text-center animate-pulse">
           Translating... Please wait.
         </div>
       )}
 
-      {/* ✅ Language & Voice Controls */}
+      {/* Language controls */}
       <div className="flex gap-4 mb-4">
         <div className="flex flex-col w-1/2">
           <label className="text-gray-600 mb-1">Source Language</label>
@@ -480,7 +423,7 @@ export default function TranslationBox() {
         </div>
       </div>
 
-      {/* ✅ Text Input and Controls */}
+      {/* Input + Mic */}
       <div className="flex gap-4 items-center mb-4">
         <textarea
           value={text}
@@ -490,14 +433,29 @@ export default function TranslationBox() {
         />
         <button
           onClick={isListening ? handleStopListening : handleStartListening}
-          className={`p-3 rounded-full text-white transition ${isListening ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'
-            }`}
+          className={`p-3 rounded-full text-white transition ${isListening ? 'bg-red-500 hover:bg-red-600' : 'bg-blue-500 hover:bg-blue-600'}`}
         >
           {isListening ? '🛑 Stop' : '🎤 Start'}
         </button>
       </div>
 
-      {/* ✅ Translated Text Output */}
+      {/* Send typed text as one sentence */}
+      <div className="flex gap-2 mb-4">
+        <button
+          onClick={() => buffer.add(text)}
+          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
+        >
+          Add Chunk
+        </button>
+        <button
+          onClick={() => buffer.flush(true)}
+          className="px-3 py-2 bg-gray-200 rounded hover:bg-gray-300"
+        >
+          Flush Now
+        </button>
+      </div>
+
+      {/* Translated output (from server broadcast) */}
       {translated && (
         <div className="mt-6">
           <h3 className="text-lg font-medium text-gray-800 mb-2">🖥️ Translated Text:</h3>
@@ -507,7 +465,7 @@ export default function TranslationBox() {
         </div>
       )}
 
-      {/* ✅ Control Buttons */}
+      {/* Controls */}
       <div className="flex gap-4 mt-6">
         <button
           onClick={handleClear}
@@ -517,8 +475,7 @@ export default function TranslationBox() {
         </button>
         <button
           onClick={() => setIsMuted(!isMuted)}
-          className={`px-4 py-2 rounded transition ${isMuted ? 'bg-gray-400' : 'bg-green-500 text-white hover:bg-green-600'
-            }`}
+          className={`px-4 py-2 rounded transition ${isMuted ? 'bg-gray-400' : 'bg-green-500 text-white hover:bg-green-600'}`}
         >
           {isMuted ? 'Unmute' : 'Mute'}
         </button>
@@ -536,7 +493,7 @@ export default function TranslationBox() {
         </div>
       </div>
 
-      {/* ✅ Voice Selection */}
+      {/* Voice selection */}
       <div className="mt-6">
         <label className="text-gray-600 mb-2 block">Choose Voice</label>
         <select
@@ -545,7 +502,7 @@ export default function TranslationBox() {
           className="p-2 border rounded shadow-sm focus:outline-none w-full"
         >
           {synthRef.current &&
-            synthRef.current.getVoices().map((voice) => (
+            synthRef.current.getVoices().map((voice: SpeechSynthesisVoice) => (
               <option key={voice.name} value={voice.name}>
                 {voice.name} ({voice.lang})
               </option>

@@ -27,7 +27,11 @@ function getPreferredNetworkIP() {
 try {
   const ip = getPreferredNetworkIP();
   const envPath = path.join(__dirname, '../.env.local');
-  const envContent = `NEXT_PUBLIC_API_BASE_URL=http://${ip}:8000\nNEXT_PUBLIC_WS_URL=ws://${ip}:8000\n`;
+
+  // ✅ Append the correct WebSocket path
+  const envContent = 
+    `NEXT_PUBLIC_API_BASE_URL=http://${ip}:8000\n` +
+    `NEXT_PUBLIC_WS_URL=ws://${ip}:8000/ws/translate\n`;
 
   fs.writeFileSync(envPath, envContent);
   console.log(`✅ .env.local updated with dynamic IP:\n${envContent}`);
