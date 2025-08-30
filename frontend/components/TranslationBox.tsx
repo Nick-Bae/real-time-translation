@@ -1,9 +1,11 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useMemo, useState, useEffect, useRef, useCallback } from 'react'
 import { throttle } from '../utils/throttle'
 import { useTranslationSocket } from '../utils/useTranslationSocket'
 import { useSentenceBuffer } from '../utils/useSentenceBuffer';
+import { useClauseCommit } from '../utils/useClauseCommit';
+import { d, g, pv } from '../utils/debug';
 
 const availableLanguages = [
   { code: 'ko', name: 'Korean' },
@@ -42,6 +44,7 @@ export default function TranslationBox() {
   const segmentCounterRef = useRef(0);
   const currentSegmentRef = useRef<number | null>(null);
   const revRef = useRef(0);
+  const finalizedIdxRef = useRef(0);
 
   const mapToLocale = (code: string) => {
     switch (code) {
@@ -61,6 +64,45 @@ export default function TranslationBox() {
     if (!recognitionRef.current || recActiveRef.current) return;
     try { recognitionRef.current.start(); } catch { }
   };
+
+  const clauseHandlers = useMemo(() => ({
+    onPartial: (t: string) => {
+      const src = (sourceLang || 'ko').split('-')[0];
+      const tgt = (targetLang || 'en').split('-')[0];
+      d('send', `partial → ${src}->${tgt} "${pv(t)}"`);
+      sendProducerText(t, src, tgt, true); // partial
+    },
+    onCommit: ({ id, rev, text, final }: { id: number; rev: number; text: string; final: boolean }) => {
+      const src = (sourceLang || 'ko').split('-')[0];
+      const tgt = (targetLang || 'en').split('-')[0];
+      d('send', `commit  → ${src}->${tgt} id=${id} rev=${rev} final=${final} "${pv(text)}"`);
+      // 👇 pass final here
+      sendProducerText(text, src, tgt, false, id, rev, final);
+    }
+  }), [sendProducerText, sourceLang, targetLang]);
+
+
+  // ✅ stable config object
+  const clauseCfg = useMemo(() => ({
+    forceAfterMs: 1400,
+    connectiveForceAfterMs: 2300,
+    vadSilenceMs: 420,
+    minChunkChars: 6,        // was 12
+    minFirstCommitChars: 8,  // was 16
+    commitConnectives: true,
+    connectiveCommitAfterMs: 900,
+    minConnectiveChars: 6,
+  }), [])
+
+  const { feedInterim, feedFinal, tick, reset: resetClause } =
+    useClauseCommit(clauseHandlers, clauseCfg)
+
+
+  // drive time-based commits ~10Hz
+  useEffect(() => {
+    const id = setInterval(() => tick(), 100)
+    return () => clearInterval(id)
+  }, [tick])
 
   const scheduleRestart = (delayMs = 300) => {
     if (restartTimerRef.current) {
@@ -117,22 +159,6 @@ export default function TranslationBox() {
 
   const throttledSendSentence = useRef(throttle(sendSentence, 800)).current
 
-  // ✅ Sentence buffer: flushes on punctuation or silence
-  const buffer = useSentenceBuffer((sentence) => {
-    // final commit for this segment
-    if (currentSegmentRef.current === null) {
-      currentSegmentRef.current = ++segmentCounterRef.current;
-      revRef.current = 0;
-    }
-    sendProducerText(sentence, sourceLang, targetLang, /* partial */ false, currentSegmentRef.current, ++revRef.current);
-
-    // reset segment so the next sentence gets a new id
-    currentSegmentRef.current = null;
-    revRef.current = 0;
-
-    setText(''); // clear interim box on commit
-  }, { timeoutMs: 1500, minLength: 4 });
-
 
   // 🧠 Speech Synthesis init
   useEffect(() => {
@@ -155,106 +181,97 @@ export default function TranslationBox() {
 
   // ====== Your robust recognition effect ======
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (!('webkitSpeechRecognition' in window)) return;
+    if (typeof window === 'undefined') return
+    if (!('webkitSpeechRecognition' in window)) return
 
-    const recognition = new (window as any).webkitSpeechRecognition();
-    recognition.lang = mapToLocale(sourceLang);
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
+    const recognition = new (window as any).webkitSpeechRecognition()
+    recognition.lang = mapToLocale(sourceLang)
+    recognition.continuous = true
+    recognition.interimResults = true
+    recognition.maxAlternatives = 1
 
     recognition.onstart = () => {
-      recActiveRef.current = true;
-      wantListeningRef.current = true; // we initiated it
-      setIsListening(true);            // keep button on Stop
-      resetIdleTimer();
-    };
+      finalizedIdxRef.current = 0
+      resetClause()
+      d('asr', 'start lang=' + mapToLocale(sourceLang))
+      recActiveRef.current = true
+      wantListeningRef.current = true
+      setIsListening(true)
+      resetIdleTimer()
+    }
 
     recognition.onend = () => {
-      recActiveRef.current = false;
+      d('asr', 'end (willRestart=' + (wantListeningRef.current && !pauseListening) + ')')
+      recActiveRef.current = false
       if (wantListeningRef.current && !pauseListening) {
-        // normal recycle → keep Stop button, restart soon
-        setIsListening(true);
-        scheduleRestart(250);
+        setIsListening(true)
+        scheduleRestart(250)
       } else {
-        // truly stopped (manual/idle)
-        setIsListening(false);
+        setIsListening(false)
       }
-    };
+    }
 
     recognition.onerror = (e: any) => {
-      const err = e?.error;
-      // benign errors → soft recover
+      const err = e?.error
       if (err === 'no-speech' || err === 'audio-capture' || err === 'network' || err === 'aborted') {
-        recActiveRef.current = false;
+        recActiveRef.current = false
         if (wantListeningRef.current && !pauseListening) {
-          setIsListening(true);  // keep Stop
-          scheduleRestart(400);
+          setIsListening(true)
+          scheduleRestart(400)
         }
-        return;
+        return
       }
-      // permission denied etc.
-      console.warn('SpeechRecognition error:', err || e);
-    };
+      console.warn('SpeechRecognition error:', err || e)
+    }
 
     recognition.onresult = (event: any) => {
-      // Build cumulative interim
-      let interimTranscript = '';
-      for (let i = event.resultIndex; i < event.results.length; ++i) {
-        const r = event.results[i];
-        interimTranscript += r[0].transcript;
-      }
-      const trimmed = interimTranscript.trim();
-      if (!trimmed) return;
+      // guard: Chrome can rebase results
+      if (finalizedIdxRef.current > event.results.length) finalizedIdxRef.current = 0
 
-      // Reset idle timer on any speech
-      resetIdleTimer();
+      let interim = ''
+      let finals = 0
 
-      // Compute delta vs last interim
-      let prev = lastInterimRef.current || '';
-      // If Chrome shrinks a lot (new utterance), reset baseline
-      if (prev && !prev.startsWith(trimmed) && trimmed.length < prev.length * NEW_UTTERANCE_DROP) {
-        prev = '';
-      }
-
-      let newPart = '';
-      if (trimmed.startsWith(prev)) {
-        newPart = trimmed.slice(prev.length);          // normal growth → tail
-      } else if (prev.startsWith(trimmed)) {
-        newPart = '';                                  // rare shrink → no delta
-      } else {
-        newPart = trimmed;                              // big jump → take full
+      for (let i = finalizedIdxRef.current; i < event.results.length; i++) {
+        const r = event.results[i]
+        const t = r[0]?.transcript ?? ''
+        if (!t) continue
+        if (r.isFinal) {
+          finals++
+          g('final', 'text', t)
+          feedFinal(t)
+          finalizedIdxRef.current = i + 1
+        } else {
+          interim += t
+        }
       }
 
-      // Ignore tiny deltas (do NOT advance baseline if we skip)
-      const nonSpaceDeltaLen = newPart.replace(/\s+/g, '').length;
-      if (nonSpaceDeltaLen < MIN_DELTA_CHARS) {
-        setText(trimmed); // show smooth interim
-        return;
+      const trimmed = interim.trim()
+      if (trimmed) {
+        d('interim', `len=${trimmed.length} finals=${finals} text="${pv(trimmed)}"`)
+        resetIdleTimer()
+        feedInterim(trimmed)
+        setText(trimmed)
+      } else if (finals) {
+        d('interim', `none finals=${finals}`)
       }
+    }
 
-      // Accept delta → advance baseline & feed buffer
-      lastInterimRef.current = trimmed;
-      buffer.add(newPart);
-      setText(trimmed);
-    };
-
-    recognitionRef.current = recognition;
-
-    // If UI says we should be listening (e.g., toggled Start), kick off start
+    recognitionRef.current = recognition
     if (isListening && !recActiveRef.current) {
-      try { recognition.start(); } catch { }
+      try { recognition.start() } catch { }
     }
 
     return () => {
-      try { recognition.stop(); } catch { }
-      recActiveRef.current = false;
-      wantListeningRef.current = false;
-      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-      if (idleTimerRef.current) clearTimeout(idleTimerRef.current);
-    };
-  }, [sourceLang, pauseListening, buffer, isListening]);
+      try { recognition.stop() } catch { }
+      recActiveRef.current = false
+      wantListeningRef.current = false
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current)
+      if (idleTimerRef.current) clearTimeout(idleTimerRef.current)
+      finalizedIdxRef.current = 0
+      resetClause()
+    }
+    // ✅ deps are stable now (handlers/config are memoized)
+  }, [sourceLang, pauseListening, isListening, feedInterim, feedFinal, resetClause])
 
 
   // ✅ Enqueue translation for TTS playback
@@ -368,6 +385,14 @@ export default function TranslationBox() {
     ttsQueueRef.current = []
     isSpeakingRef.current = false
   }
+  const lastLogged = useRef<string | null>(null);
+  useEffect(() => {
+    if (!translated) return;
+    if (translated === lastLogged.current) return;
+    console.log('[RT][commit] translation:', translated);
+    lastLogged.current = translated;
+  }, [translated]);
+
 
   return (
     <div className="w-full max-w-3xl mx-auto p-6 bg-white rounded-xl shadow-md">

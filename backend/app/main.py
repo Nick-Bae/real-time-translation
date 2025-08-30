@@ -1,9 +1,10 @@
+# app/main.py
 import os, json
 import asyncio
 import re
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Body, APIRouter  # ✅ APIRouter added
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -13,24 +14,41 @@ from app.routes import translate as translate_routes
 from app.socket_manager import manager
 from app.utils.translate import translate_text as _translate_sync  # your current translator
 
+import inspect, logging
+log = logging.getLogger("rt")  # ✅ logger defined
+
+# ---- translator alias (works with translate_text or translate_api; sync/async) ----
+try:
+    from app.utils.translate import translate_text as _translate_impl  # type: ignore
+except Exception:
+    from app.utils.translate import translate_api as _translate_impl  # type: ignore
+
+async def translate_text(text: str, src: str, tgt: str) -> str:
+    res = _translate_impl(text, src, tgt)
+    if inspect.isawaitable(res):
+        return await res
+    return res
+
+def norm(code: str | None) -> str:
+    return (code or '').lower().split('-')[0]
+
 # ---------------------------
 # App setup
 # ---------------------------
 app = FastAPI(title="Hybrid Real-Time Translation Backend", version="0.3.0")
+router = APIRouter()  # ✅ router created
 load_dotenv()
 
-origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
-
+# Allow dev origins (you can tighten later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],          # ✅ open for dev; restrict in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# Keep your existing router
+# Keep your existing HTTP routes
 app.include_router(translate_routes.router, prefix="/api")
 
 @app.get("/")
@@ -40,7 +58,6 @@ def read_root():
 # ---------------------------
 # ===== Hybrid Mode Additions =====
 # ---------------------------
-
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
@@ -119,7 +136,7 @@ class ScriptStore:
 
 STORE = ScriptStore()
 
-# Use your existing translator in a thread-safe async wrapper
+# Use your existing translator in a thread-safe async wrapper (not used by WS alias, but kept)
 async def translate_fallback(text: str, source_lang: str = "ko", target_lang: str = "en") -> str:
     return await asyncio.to_thread(_translate_sync, text, source_lang, target_lang)
 
@@ -166,78 +183,124 @@ async def translate_api(inp: TranslateIn):
 # ---------------------------
 # WebSocket: producer + listeners
 # ---------------------------
-@app.websocket("/ws/translate")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+# app/main.py (replace only the ws_translate function)
+@router.websocket("/ws/translate")
+async def ws_translate(ws: WebSocket):
+    await manager.connect(ws)
+
+    # per-connection state
+    partial_task: asyncio.Task | None = None
+    debounce_task: asyncio.Task | None = None
+    committed_kr_by_seg: dict[int, str] = {}  # accumulate KR commits per segment
+
+    async def translate_and_broadcast(text: str, src: str, tgt: str, is_partial: bool, seg_id, rev, mode="realtime"):
+        out = await translate_text(text, src, tgt)
+        await manager.broadcast({
+            "type": "translation",
+            "payload": out,
+            "lang": tgt,
+            "meta": {
+                "partial": is_partial,
+                "segment_id": seg_id,
+                "rev": rev,
+                "mode": mode,
+                "translated": out,
+            },
+        })
+
+    def norm_ws(s: str) -> str:
+        return " ".join((s or "").split())
+
+    def strip_prefix(full: str, prefix: str) -> str:
+        f, p = norm_ws(full), norm_ws(prefix)
+        if not p:
+            return full
+        if f.startswith(p):
+            # find the slice index by length of normalized prefix
+            want = len(p)
+            seen = 0
+            for i, ch in enumerate(full):
+                seen += (0 if ch.isspace() else 1)
+                if seen >= want:
+                    return full[i+1:].lstrip()
+        return full
+
+    async def schedule_partial(text: str, src: str, tgt: str, seg_id, rev):
+        nonlocal partial_task, debounce_task
+        # cancel older debounce/partial
+        if debounce_task and not debounce_task.done():
+            debounce_task.cancel()
+        if partial_task and not partial_task.done():
+            partial_task.cancel()
+
+        async def _debounced():
+            try:
+                # small debounce so we don't translate every keystroke-like interim
+                await asyncio.sleep(0.12)
+                partial_task = asyncio.create_task(
+                    translate_and_broadcast(text, src, tgt, True, seg_id, rev)
+                )
+                await partial_task
+            except asyncio.CancelledError:
+                pass
+
+        debounce_task = asyncio.create_task(_debounced())
+
     try:
         while True:
-            try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
-            except asyncio.TimeoutError:
+            msg = await ws.receive_json()
+            mtype = msg.get("type")
+            src = norm(msg.get("source"))
+            tgt = norm(msg.get("target"))
+
+            if mtype == "producer_partial":
+                # translate latest partial with debounce; drop older ones
+                await schedule_partial(msg.get("text",""), src, tgt, msg.get("id"), msg.get("rev"))
                 continue
 
-            try:
-                inp = json.loads(raw)
-            except Exception:
-                await websocket.send_text(json.dumps({"error": "invalid_json"}))
-                continue
-
-            text = (inp.get("text") or "").strip()
-            source_lang = inp.get("source_lang", "ko")
-            target_lang = inp.get("target_lang", "en")
-            partial = bool(inp.get("partial", False))
-            segment_id = inp.get("segment_id", None)
-            rev = int(inp.get("rev", 0))  # optional from client
-
-            if not text:
-                await websocket.send_text(json.dumps({"error": "empty_text"}))
-                continue
-
-            # Try scripted match first
-            if STORE.is_ready():
-                score, pair, matched_src = STORE.best_match(text)
-                if score >= STORE.config.threshold and pair:
-                    out = TranslateOut(
-                        translated=pair.target,
-                        mode="pre",
-                        match_score=score,
-                        matched_source=matched_src,
-                        method=STORE.config.method,
-                        original=text,
-                    ).dict()
-                    meta = {**out, "partial": partial, "segment_id": segment_id, "rev": rev}
-                    await manager.broadcast({
-                        "type": "translation",
-                        "lang": target_lang,
-                        "payload": out["translated"],
-                        "meta": meta,
-                    })
-                    await websocket.send_text(json.dumps(meta, ensure_ascii=False))
+            if mtype == "producer_commit":
+                text = (msg.get("text") or "").strip()
+                if not text:
                     continue
+                seg_id = int(msg.get("id") or 0)
+                rev = int(msg.get("rev") or 0)
+                is_final = bool(msg.get("final"))
 
-            # Fallback live translation (also for partials)
-            translated = await translate_fallback(text, source_lang, target_lang)
-            out = TranslateOut(
-                translated=translated,
-                mode="realtime",
-                match_score=0.0,
-                matched_source=None,
-                method=STORE.config.method,
-                original=text,
-            ).dict()
+                # cancel any in-flight partial work
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                if partial_task and not partial_task.done():
+                    partial_task.cancel()
 
-            meta = {**out, "partial": partial, "segment_id": segment_id, "rev": rev}
-            await manager.broadcast({
-                "type": "translation",
-                "lang": target_lang,
-                "payload": out["translated"],
-                "meta": meta,
-            })
-            await websocket.send_text(json.dumps(meta, ensure_ascii=False))
+                if not is_final:
+                    # accumulate KR for this seg (for later final suppression)
+                    prev = committed_kr_by_seg.get(seg_id, "")
+                    committed_kr_by_seg[seg_id] = (prev + (" " if prev and not prev.endswith(" ") else "") + text).strip()
 
-    except WebSocketDisconnect:
-        await manager.disconnect(websocket)
-        print("❌ Listener/producer disconnected")
+                    # translate immediately
+                    await translate_and_broadcast(text, src, tgt, False, seg_id, rev)
+                else:
+                    # ASR final → only translate the delta beyond what we've committed
+                    prev = committed_kr_by_seg.get(seg_id, "")
+                    delta = strip_prefix(text, prev)
+                    # if nothing new (or extremely small), skip final
+                    if len(norm_ws(delta)) < 2:
+                        # no-op: we've already sent all pieces
+                        continue
+                    await translate_and_broadcast(delta, src, tgt, False, seg_id, rev, mode="realtime")
+                    # clear seg accumulator
+                    committed_kr_by_seg.pop(seg_id, None)
+
+            elif mtype == "consumer_join":
+                log.info("consumer joined")
+            else:
+                log.debug(f"unknown ws msg: {msg}")
+
+    except Exception as e:
+        log.warning(f"ws closed: {e}")
+    finally:
+        manager.disconnect(ws)
+
 
 # ---------------------------
 # Keep your existing broadcast endpoint
@@ -257,3 +320,6 @@ async def broadcast_translation(request: Request):
     print("📡 Broadcasting translation:", payload)
     await manager.broadcast(payload)
     return {"message": "Broadcasted"}
+
+# ✅ mount the WebSocket router at the very end
+app.include_router(router)
