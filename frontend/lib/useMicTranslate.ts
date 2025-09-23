@@ -1,7 +1,7 @@
 // frontend/lib/useMicTranslate.ts
 export type WsMsg =
   | { type: 'interim_kr'; text: string }
-  | { type: 'final_kr';  text: string }
+  | { type: 'final_kr'; text: string }
   | { type: 'fast_final'; en: string; from: 'google' };
 
 export type MicCtl = { start: () => Promise<void>; stop: () => Promise<void> };
@@ -24,7 +24,8 @@ export function startMicStream(
 
   async function start() {
     const origin = window.location.origin;
-    const workletUrl = `${origin}/workers/pcm-worklet-processor.js`;
+    const workletUrl = `${window.location.origin}/workers/pcm-worklet-processor.js`;
+    const MODE = (process.env.NEXT_PUBLIC_RESAMPLE_QUALITY || 'better') as 'better' | 'best';
 
     // Secure context (required for AudioWorklet)
     const isSecure =
@@ -56,6 +57,8 @@ export function startMicStream(
       channelCount: 1,
       channelCountMode: 'explicit',
       channelInterpretation: 'speakers',
+      // ⬇⬇ pass the mode to the worklet
+      processorOptions: { mode: MODE },
     });
 
     sink = audioCtx.createGain();
@@ -80,7 +83,7 @@ export function startMicStream(
       // normalize to ArrayBuffer (handles ArrayBuffer or TypedArray)
       const buf: ArrayBuffer =
         m instanceof ArrayBuffer ? m :
-        (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
+          (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
 
       if (!buf) {
         console.warn('Worklet posted unknown payload:', m);
