@@ -1,15 +1,21 @@
-// frontend/lib/useMicTranslate.ts
 export type WsMsg =
   | { type: 'interim_kr'; text: string }
-  | { type: 'final_kr'; text: string }
+  | { type: 'final_kr';  text: string }
   | { type: 'fast_final'; en: string; from: 'google' };
 
 export type MicCtl = { start: () => Promise<void>; stop: () => Promise<void> };
 
+type ReconnectOpts = {
+  minDelayMs?: number;   // first retry delay
+  maxDelayMs?: number;   // cap delay
+  maxRetries?: number;   // 0 = infinite
+};
+
 export function startMicStream(
   wsUrl: string,
   onMsg: (m: WsMsg) => void,
-  onRms?: (rms: number) => void
+  onRms?: (rms: number) => void,
+  reconnectOpts: ReconnectOpts = {}
 ): MicCtl {
   let ws: WebSocket | null = null;
   let audioCtx: AudioContext | null = null;
@@ -17,39 +23,91 @@ export function startMicStream(
   let stream: MediaStream | null = null;
   let sink: GainNode | null = null;
   let keepAlive: ReturnType<typeof setInterval> | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Buffer PCM frames until the WS is OPEN
+  // buffer PCM frames while WS is not OPEN
   const pending: ArrayBuffer[] = [];
-  let wsOpen = false;
 
-  async function start() {
+  // backoff settings
+  const MIN = reconnectOpts.minDelayMs ?? 800;
+  const MAX = reconnectOpts.maxDelayMs ?? 8000;
+  const MAX_RETRIES = reconnectOpts.maxRetries ?? 0; // 0 = infinite
+  let attempts = 0;
+  let stopped = false; // set true on .stop() to disable reconnects
+
+  function scheduleReconnect(reason: string) {
+    if (stopped) return;
+    if (MAX_RETRIES > 0 && attempts >= MAX_RETRIES) {
+      console.warn('[WS] reconnect: max retries reached');
+      return;
+    }
+    const base = Math.min(MAX, MIN * Math.pow(2, attempts));
+    const jitter = Math.random() * base * 0.2; // 0–20% jitter
+    const delay = Math.floor(base + jitter);
+    attempts++;
+    console.warn(`[WS] reconnect in ${delay}ms (attempt ${attempts}) – ${reason}`);
+    reconnectTimer && clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => connectWs(), delay);
+  }
+
+  function bindWorkletPort() {
+    if (!workletNode) return;
+    workletNode.port.onmessage = (ev) => {
+      const m = ev.data;
+
+      // small JSON objects from the worklet
+      if (m && typeof m === 'object' && !(m instanceof ArrayBuffer) && !ArrayBuffer.isView(m)) {
+        if ((m as any).rms != null) onRms?.(Number((m as any).rms));
+        return;
+      }
+
+      // normalize to ArrayBuffer (handles ArrayBuffer or TypedArray)
+      const buf: ArrayBuffer =
+        m instanceof ArrayBuffer ? m :
+        (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
+
+      if (!buf) {
+        console.warn('Worklet posted unknown payload:', m);
+        return;
+      }
+
+      const s = ws;
+      if (s && s.readyState === WebSocket.OPEN) {
+        s.send(buf);
+      } else {
+        pending.push(buf);
+      }
+    };
+  }
+
+  async function initAudio() {
+    if (audioCtx) return; // already initialized
     const origin = window.location.origin;
-    const workletUrl = `${window.location.origin}/workers/pcm-worklet-processor.js`;
-    const MODE = (process.env.NEXT_PUBLIC_RESAMPLE_QUALITY || 'better') as 'better' | 'best';
+    const workletUrl = `${origin}/workers/pcm-worklet-processor.js`;
 
-    // Secure context (required for AudioWorklet)
+    // secure context check
     const isSecure =
       window.isSecureContext || origin.startsWith('https://') || origin.includes('localhost');
     if (!isSecure) throw new Error('AudioWorklet requires a secure context (localhost or HTTPS).');
 
-    // Verify the worklet file is served
+    // probe file
     const probe = await fetch(workletUrl, { cache: 'no-store' });
     if (!probe.ok) throw new Error(`Worklet not reachable: ${workletUrl} (HTTP ${probe.status})`);
     console.log('Worklet fetch OK. First bytes:', (await probe.clone().text()).slice(0, 80));
 
-    // Mic
+    // mic
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: false },
     });
 
-    // Audio graph
+    // audio graph
     audioCtx = new AudioContext({ sampleRate: 48000 });
     await audioCtx.audioWorklet.addModule(workletUrl);
     console.log('AudioWorklet addModule OK:', workletUrl, 'sampleRate=', audioCtx.sampleRate);
 
     const src = audioCtx.createMediaStreamSource(stream);
 
-    // ONE output so we can connect to a silent sink (keeps graph alive)
+    // one output so we can connect to a silent sink (keeps graph alive)
     workletNode = new AudioWorkletNode(audioCtx, 'pcm16-worklet', {
       numberOfInputs: 1,
       numberOfOutputs: 1,
@@ -57,8 +115,6 @@ export function startMicStream(
       channelCount: 1,
       channelCountMode: 'explicit',
       channelInterpretation: 'speakers',
-      // ⬇⬇ pass the mode to the worklet
-      processorOptions: { mode: MODE },
     });
 
     sink = audioCtx.createGain();
@@ -69,72 +125,38 @@ export function startMicStream(
     workletNode.connect(sink);
     sink.connect(audioCtx.destination);
 
-    // Forward worker messages immediately; queue frames until WS is open
-    workletNode.port.onmessage = (ev) => {
-      const m = ev.data;
-
-      // small JSON objects from the worklet
-      if (m && typeof m === 'object' && !(m instanceof ArrayBuffer) && !ArrayBuffer.isView(m)) {
-        if ((m as any).rms != null) onRms?.(Number((m as any).rms));
-        // if ((m as any).dbg) console.log('worklet dbg', (m as any).dbg);
-        return;
-      }
-
-      // normalize to ArrayBuffer (handles ArrayBuffer or TypedArray)
-      const buf: ArrayBuffer =
-        m instanceof ArrayBuffer ? m :
-          (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
-
-      if (!buf) {
-        console.warn('Worklet posted unknown payload:', m);
-        return;
-      }
-      console.log('TX -> WS bytes:', buf.byteLength);
-
-      // Use a local snapshot of ws to satisfy TS and avoid races
-      const s = ws;
-      if (s && s.readyState === WebSocket.OPEN) {
-        // send immediately
-        // console.log('TX -> WS bytes:', buf.byteLength);
-        s.send(buf);
-      } else {
-        // queue until socket opens
-        pending.push(buf);
-      }
-    };
-
     if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-    // WebSocket
-    ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
+    bindWorkletPort();
+  }
 
-    ws.onopen = () => {
-      wsOpen = true;
-      const s = ws; // snapshot
-      if (!s) return;
+  function connectWs() {
+    if (stopped) return;
+    const s = new WebSocket(wsUrl);
+    ws = s;
+    s.binaryType = 'arraybuffer';
+
+    s.onopen = () => {
       console.log('WS open:', s.url);
+      attempts = 0; // reset backoff on success
 
-      // keep-alive
+      // keep-alive (send ~20ms “silence” every 2s)
       if (!keepAlive) {
         keepAlive = setInterval(() => {
-          const ss = ws; // snapshot inside timer
-          if (ss && ss.readyState === WebSocket.OPEN) {
-            ss.send(new ArrayBuffer(640)); // ~20ms silence @16kHz mono 16-bit
+          const sock = ws;
+          if (sock && sock.readyState === WebSocket.OPEN) {
+            sock.send(new ArrayBuffer(640));
           }
         }, 2000);
       }
 
-      // flush frames queued before the socket opened
-      while (pending.length) {
-        const ss = ws;
-        if (!ss || ss.readyState !== WebSocket.OPEN) break;
-        const frame = pending.shift()!;
-        ss.send(frame);
+      // flush queued frames
+      while (pending.length && s.readyState === WebSocket.OPEN) {
+        s.send(pending.shift()!);
       }
     };
 
-    ws.onmessage = (ev) => {
+    s.onmessage = (ev) => {
       try {
         const m = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
         onMsg(m);
@@ -143,27 +165,49 @@ export function startMicStream(
       }
     };
 
-    ws.onclose = (e) => {
-      wsOpen = false;
-      console.log('WS closed', e.code, e.reason);
+    s.onclose = (e) => {
+      console.warn('WS closed', e.code, e.reason);
+      // clear keepalive; we’ll recreate on next open
+      if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+      scheduleReconnect(`code=${e.code} reason=${e.reason || 'n/a'}`);
     };
 
-    ws.onerror = (e) => console.error('WS error', e);
+    s.onerror = (e) => {
+      console.error('WS error', e);
+      // error often followed by onclose; if not, schedule a reconnect anyway
+    };
+  }
+
+  async function start() {
+    stopped = false;
+    await initAudio();   // (idempotent) set up mic/worklet/sink once
+    connectWs();         // connect or reconnect
   }
 
   async function stop() {
+    stopped = true;
     try {
+      reconnectTimer && clearTimeout(reconnectTimer);
+      reconnectTimer = null;
       if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
       pending.length = 0;
-      if (workletNode) workletNode.port.onmessage = null!;
+
+      if (workletNode) workletNode.port.onmessage = null as any;
       if (workletNode) workletNode.disconnect();
       if (sink) sink.disconnect();
-      if (audioCtx) await audioCtx.close();
-      if (stream) stream.getTracks().forEach(t => t.stop());
+
       const s = ws;
-      if (s && (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING)) s.close();
+      if (s && (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING)) {
+        try { s.close(); } catch {}
+      }
+      ws = null;
+
+      if (audioCtx) await audioCtx.close();
+      audioCtx = null;
+
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      stream = null;
     } catch { /* no-op */ }
-    ws = null; audioCtx = null; workletNode = null; stream = null; sink = null; wsOpen = false;
   }
 
   return { start, stop };
