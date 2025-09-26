@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from asyncio import CancelledError
+from typing import Set
+from starlette.websockets import WebSocketState
 
 # Local modules
 from app.socket_manager import manager
@@ -72,6 +74,21 @@ app.add_middleware(
 # Keep your existing HTTP routes under /api
 app.include_router(translate_routes.router, prefix="/api")
 
+VIEWERS: Set[WebSocket] = set()
+
+async def broadcast(payload: dict):
+    dead = []
+    for v in list(VIEWERS):
+        try:
+            await v.send_json(payload)
+        except Exception:
+            dead.append(v)
+    for v in dead:
+        try:
+            VIEWERS.remove(v)
+        except KeyError:
+            pass
+
 # Simple root for liveness
 @app.get("/")
 def root():
@@ -109,6 +126,29 @@ KEEPALIVE_GAP_S = 0.75             # if nothing for 750 ms, feed silence
 
 @app.websocket("/ws/translate")
 async def ws_translate(ws: WebSocket):
+    # role=viewer || producer (default producer)
+    role = (ws.query_params.get("role") or "producer").lower()
+
+    # VIEWER: just register, keep connection alive, and exit when closed
+    if role == "viewer":
+        await ws.accept()
+        logger.info("Viewer connected")
+        VIEWERS.add(ws)
+        try:
+            # keep alive until client closes; no STT, no audio expected
+            while True:
+                # optional: ping/pong or small sleep
+                if ws.application_state == WebSocketState.DISCONNECTED:
+                    break
+                await asyncio.sleep(30)
+        except Exception:
+            pass
+        finally:
+            VIEWERS.discard(ws)
+            logger.info("Viewer disconnected")
+        return
+
+    # PRODUCER flow (your current code, plus broadcast calls)
     await ws.accept()
     logger.info("WS client connected")
 
@@ -124,8 +164,6 @@ async def ws_translate(ws: WebSocket):
                     with cv:
                         q.append(data)
                         cv.notify()
-                    # optional visibility
-                    # logger.info("WS rx %d bytes (queue=%d)", len(data), len(q))
         except (WebSocketDisconnect, CancelledError):
             pass
         finally:
@@ -144,49 +182,45 @@ async def ws_translate(ws: WebSocket):
                 elif closed:
                     return
 
-    # ---- NEW: capture running loop; thread-safe queue to push STT msgs back ----
+    # thread worker → async queue
     loop = asyncio.get_running_loop()
     stt_out: asyncio.Queue[dict] = asyncio.Queue()
 
     def stt_worker():
-        """
-        Runs in a plain thread. DO NOT touch asyncio APIs without using the loop
-        we captured above. Push messages using run_coroutine_threadsafe().
-        """
         try:
             for msg in stt_streaming_transcripts(pcm_iter_sync()):
-                # push to async queue from the thread
                 asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
         except Exception as e:
             logger.error("STT worker error: %s", e, exc_info=True)
         finally:
-            # send a sentinel to end the async consumer
             asyncio.run_coroutine_threadsafe(stt_out.put({"type": "__stt_done__"}), loop)
 
-    # kick off the worker thread
     worker = threading.Thread(target=stt_worker, name="stt-worker", daemon=True)
     worker.start()
 
     async def stt_consumer():
-        """
-        Async task that receives STT messages from stt_out and forwards them to the WS.
-        """
         logger.info("STT supervisor started")
         try:
             while True:
                 msg = await stt_out.get()
-                if msg.get("type") == "__stt_done__":
-                    break
+                if msg.get("type") == "__stt_done__": break
 
                 if msg["type"] == "interim":
-                    await ws.send_json({"type": "interim_kr", "text": msg["text"]})
+                    payload = {"type": "interim_kr", "text": msg["text"]}
+                    await ws.send_json(payload)
+                    await broadcast(payload)
                 else:
-                    kr = msg["text"].strip()
-                    await ws.send_json({"type": "final_kr", "text": kr})
+                    kr = (msg["text"] or "").strip()
+                    payload_final = {"type": "final_kr", "text": kr}
+                    await ws.send_json(payload_final)
+                    await broadcast(payload_final)
+
                     en = translate_kr_to_en(kr, use_glossary=True)
-                    await ws.send_json({"type": "fast_final", "en": en, "from": "google"})
+                    payload_fast = {"type": "fast_final", "en": en, "from": "google"}
+                    await ws.send_json(payload_fast)
+                    await broadcast(payload_fast)
+
         except Exception as e:
-            # common benign case is the Speech stream aborting on silence/timeout
             if "timed out after receiving no more client requests" in str(e).lower():
                 logger.warning("Streaming aborted: %s", e)
             else:
@@ -194,15 +228,10 @@ async def ws_translate(ws: WebSocket):
         finally:
             logger.info("STT supervisor finished")
 
-    feeder_task = asyncio.create_task(feeder())
+    feeder_task   = asyncio.create_task(feeder())
     consumer_task = asyncio.create_task(stt_consumer())
-
-    # Wait for either to finish; cancel the other
     done, pending = await asyncio.wait({feeder_task, consumer_task}, return_when=asyncio.FIRST_COMPLETED)
-    for t in pending:
-        t.cancel()
-
-    # Don't call ws.close() here; uvicorn/websockets will handle shutdown.
+    for t in pending: t.cancel()
     logger.info("WS handler return")
 
 # ------------------------------------------------------------------------------
