@@ -1,130 +1,146 @@
 // utils/useSubtitleSocket.ts
-"use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type MsgInterimKR = { type: "interim_kr"; text: string };
-type MsgFinalKR   = { type: "final_kr";  text: string };
-type MsgFastFinal = { type: "fast_final"; en: string; from?: string };
+type InterimKR = { type: "interim_kr"; text: string };
+type FinalKR   = { type: "final_kr";  text: string };
+type FastFinal = { type: "fast_final"; en: string; from?: string };
 
-type ServerMsg = MsgInterimKR | MsgFinalKR | MsgFastFinal | Record<string, unknown>;
+function isInterim(m: any): m is InterimKR { return m && m.type === "interim_kr" && typeof m.text === "string"; }
+function isFinalKR(m: any): m is FinalKR   { return m && m.type === "final_kr"  && typeof m.text === "string"; }
+function isFastFinal(m: any): m is FastFinal { return m && m.type === "fast_final" && typeof m.en === "string"; }
 
-function isInterim(m: ServerMsg): m is MsgInterimKR {
-  return (m as any)?.type === "interim_kr" && typeof (m as any)?.text === "string";
-}
-function isFinalKR(m: ServerMsg): m is MsgFinalKR {
-  return (m as any)?.type === "final_kr"  && typeof (m as any)?.text === "string";
-}
-function isFastFinal(m: ServerMsg): m is MsgFastFinal {
-  return (m as any)?.type === "fast_final" && typeof (m as any)?.en === "string";
-}
+type Options = {
+  maxLines?: number;           // how many lines to keep on screen
+  track?: "en" | "kr" | "both" // which language(s) to keep as lines
+};
 
-export function useSubtitleSocket(explicitUrl?: string) {
+export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
+  const maxLines = Math.max(1, opts.maxLines ?? 3);
+  const track = opts.track ?? "en";
+
   const [connected, setConnected] = useState(false);
-  const [krInterim, setKrInterim] = useState("");
-  const [krFinal,   setKrFinal]   = useState("");
-  const [enFinal,   setEnFinal]   = useState("");
 
-  // simple throttle for interim updates
+  // live preview (KR interim)
+  const [krInterim, setKrInterim] = useState("");
+
+  // latest single finals (if you still want them)
+  const [krFinal, setKrFinal] = useState("");
+  const [enFinal, setEnFinal] = useState("");
+
+  // NEW: rolling lines
+  const [krLines, setKrLines] = useState<string[]>([]);
+  const [enLines, setEnLines] = useState<string[]>([]);
+
+  // throttle interim
   const rafId = useRef(0);
-  const interimBuf = useRef<string | null>(null);
+  const pendingInterim = useRef<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const stopRef = useRef(false);
-  const backoffMs = useRef(0);
+  const backoff = useRef(0);
+  const stopFlag = useRef(false);
 
-  // Resolve the URL:
-  // 1) explicit param wins
-  // 2) NEXT_PUBLIC_WS_URL (e.g. ws://host:8000/ws/translate)
-  // 3) fallback to current origin + /ws/translate (client-only)
-  const url = useMemo(() => {
-    if (explicitUrl) return explicitUrl;
-    if (typeof process !== "undefined" && process.env.NEXT_PUBLIC_WS_URL) {
-      return process.env.NEXT_PUBLIC_WS_URL!;
-    }
+  // Resolve viewing WS URL (append role=viewer)
+  const resolvedUrl = useMemo(() => {
+    const withViewer = (u: string) => (u.includes("?") ? `${u}&role=viewer` : `${u}?role=viewer`);
+    if (explicitUrl) return withViewer(explicitUrl);
+
+    const env = process.env.NEXT_PUBLIC_WS_URL;
+    if (env && /^wss?:\/\//i.test(env)) return withViewer(env);
+
     if (typeof window !== "undefined") {
-      const u = new URL(window.location.href);
-      u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-      u.pathname = "/ws/translate";
-      u.search = "";
-      u.hash = "";
-      return u.toString();
+      const { protocol, host } = window.location;
+      const wsProto = protocol === "https:" ? "wss:" : "ws:";
+      return `${wsProto}//${host}/ws/translate?role=viewer`;
     }
-    return ""; // SSR placeholder; hook won’t connect until client
+    return "";
   }, [explicitUrl]);
 
+  // helper: push a new line and trim
+  function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
+    setter(prev => {
+      const next = prev.concat(text).slice(-maxLines);
+      return next;
+    });
+  }
+
   useEffect(() => {
-    if (!url) return; // avoid SSR issues
-    stopRef.current = false;
+    if (!resolvedUrl) return;
+    stopFlag.current = false;
 
-    const scheduleReconnect = () => {
-      if (stopRef.current) return;
-      backoffMs.current = Math.min(backoffMs.current * 2 || 600, 8000);
+    function scheduleReconnect() {
+      if (stopFlag.current) return;
+      backoff.current = Math.min(backoff.current * 2 || 800, 8000);
       const jitter = 0.5 + Math.random() * 0.5;
-      const delay = Math.round(backoffMs.current * jitter);
-      setTimeout(connect, delay);
-    };
+      setTimeout(connect, Math.round(backoff.current * jitter));
+    }
 
-    const connect = () => {
-      if (stopRef.current) return;
+    function connect() {
+      if (stopFlag.current) return;
       try {
-        const ws = new WebSocket(url);
+        const ws = new WebSocket(resolvedUrl);
         wsRef.current = ws;
 
-        ws.onopen = () => {
-          setConnected(true);
-          backoffMs.current = 0;
-        };
-
-        ws.onclose = () => {
-          setConnected(false);
-          wsRef.current = null;
-          scheduleReconnect();
-        };
-
-        ws.onerror = () => {
-          // will be followed by onclose
-        };
+        ws.onopen = () => { setConnected(true); backoff.current = 0; };
+        ws.onclose = () => { setConnected(false); wsRef.current = null; scheduleReconnect(); };
+        ws.onerror = () => { /* close will follow */ };
 
         ws.onmessage = (e) => {
           try {
             const raw = typeof e.data === "string" ? e.data : new TextDecoder().decode(e.data);
-            const msg: ServerMsg = JSON.parse(raw);
+            const msg: unknown = JSON.parse(raw);
 
             if (isInterim(msg)) {
-              interimBuf.current = msg.text || "";
+              const txt = msg.text || "";
+              pendingInterim.current = txt;
               if (!rafId.current) {
                 rafId.current = requestAnimationFrame(() => {
                   rafId.current = 0;
-                  setKrInterim(interimBuf.current || "");
-                  interimBuf.current = null;
+                  setKrInterim(pendingInterim.current || "");
+                  pendingInterim.current = null;
                 });
               }
-            } else if (isFinalKR(msg)) {
+              return;
+            }
+
+            if (isFinalKR(msg)) {
               const t = (msg.text || "").trim();
               setKrFinal(t);
-              setKrInterim(""); // clear preview once we commit
-            } else if (isFastFinal(msg)) {
-              const t = (msg.en || "").trim();
-              if (t) setEnFinal(t);
+              setKrInterim("");
+              if (track === "kr" || track === "both") pushLine(setKrLines, t);
+              return;
             }
-          } catch {
-            // ignore non-JSON / pings
-          }
+
+            if (isFastFinal(msg)) {
+              const t = (msg.en || "").trim();
+              setEnFinal(t);
+              if (t && (track === "en" || track === "both")) pushLine(setEnLines, t);
+              return;
+            }
+          } catch { /* ignore non-JSON */ }
         };
       } catch {
         scheduleReconnect();
       }
-    };
+    }
 
     connect();
-
     return () => {
-      stopRef.current = true;
+      stopFlag.current = true;
       if (rafId.current) cancelAnimationFrame(rafId.current);
       try { wsRef.current?.close(); } catch {}
       wsRef.current = null;
     };
-  }, [url]);
+  }, [resolvedUrl, track, maxLines]);
 
-  return { connected, krInterim, krFinal, enFinal };
+  return {
+    connected,
+    // live preview
+    krInterim,
+    // latest final (single)
+    krFinal,
+    enFinal,
+    // rolling lines for multi-line display
+    krLines,
+    enLines,
+  };
 }
