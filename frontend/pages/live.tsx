@@ -1,109 +1,166 @@
 // frontend/pages/live.tsx
-import { useEffect, useRef, useState } from 'react';
-import { startMicStream } from '../lib/useMicTranslate';
+"use client";
 
+import { useRef, useState } from "react";
+import { startMicStream } from "../lib/useMicTranslate";
+
+type Lang = { label: string; stt: string; tr: string };
+
+const LANGS: Lang[] = [
+  { label: "Korean",  stt: "ko-KR",  tr: "ko" },
+  { label: "English", stt: "en-US", tr: "en" },
+  { label: "Spanish", stt: "es-ES", tr: "es" },
+  { label: "Japanese",stt: "ja-JP", tr: "ja" },
+  { label: "Chinese (CMN)", stt: "cmn-Hans-CN", tr: "zh" },
+];
+
+const VOICE_BY_TR: Record<string, string> = {
+  en: "en-US-Wavenet-D",
+  es: "es-ES-Standard-A",
+  ja: "ja-JP-Wavenet-A",
+  ko: "ko-KR-Wavenet-A",
+  zh: "cmn-CN-Wavenet-A",
+};
+
+// Backing REST + WS bases from your env (unchanged)
 const API = process.env.NEXT_PUBLIC_API_BASE_URL!;
-const WS = process.env.NEXT_PUBLIC_WS_URL!;
+const WS_BASE = process.env.NEXT_PUBLIC_WS_URL!; // should already be .../ws/translate
 
 export default function Live() {
-  const [krInterim, setKrInterim] = useState('');
-  const [krFinal, setKrFinal] = useState('');
-  const [en, setEn] = useState('');
-  const [status, setStatus] = useState<'idle' | 'running' | 'stopped' | 'error'>('idle');
-  const [errMsg, setErrMsg] = useState<string>('');
+  // UI state
+  const [srcIdx, setSrcIdx] = useState<number>(0); // default Korean
+  const [dstIdx, setDstIdx] = useState<number>(1); // default English
+
+  // stream state
+  const [krInterim, setKrInterim] = useState("");
+  const [krFinal, setKrFinal] = useState("");
+  const [en, setEn] = useState("");
+  const [status, setStatus] = useState<"idle" | "running" | "stopped" | "error">("idle");
+  const [errMsg, setErrMsg] = useState<string>("");
   const [micRms, setMicRms] = useState<number>(0);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const ctlRef = useRef<ReturnType<typeof startMicStream> | null>(null);
 
-  // create controller once
-  // pages/live.tsx
-  useEffect(() => {
-    ctlRef.current = startMicStream(
-      WS,
-      async (m) => {
-        if (m.type === 'interim_kr') setKrInterim(m.text);
-        if (m.type === 'final_kr') setKrFinal(m.text);
-        if (m.type === 'fast_final') {
-          setEn(m.en);
-          try {
-            const res = await fetch(`${API}/api/tts`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text: m.en, voice: 'en-US-Wavenet-D' }),
-            });
-            const blob = await res.blob();
-            const url = URL.createObjectURL(blob);
-            const a = audioRef.current!;
-            a.src = url;
-            await a.play().catch(() => { });
-          } catch (e) { console.error(e); }
-        }
-      },
-      // optional: mic level UI (will only fire if worker posts {rms})
-      (rms) => setMicRms(rms)
-    );
+  // Build a WS URL with role + chosen languages + voice
+  function buildWsUrl() {
+    const src = LANGS[srcIdx];
+    const dst = LANGS[dstIdx];
+    const voice = VOICE_BY_TR[dst.tr] || "en-US-Wavenet-D";
 
-    return () => { ctlRef.current?.stop(); ctlRef.current = null; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const u = new URL(WS_BASE);
+    // IMPORTANT: backend expects role
+    u.searchParams.set("role", "producer");
+    u.searchParams.set("src", src.stt);    // STT language, e.g. "en-US"
+    u.searchParams.set("dst", dst.tr);     // Translate target, e.g. "ko"
+    u.searchParams.set("voice", voice);
+    return u.toString();
+  }
 
-  const testEchoUrl = process.env.NEXT_PUBLIC_WS_URL!.replace('/ws/translate', '/ws/echo-bytes');
-  ctlRef.current = startMicStream(testEchoUrl, (m) => {
-    // the echo endpoint occasionally sends {"echo_bytes_total": N}
-    if ((m as any).echo_bytes_total) {
-      console.log('echo total bytes from server:', (m as any).echo_bytes_total);
-    }
-  });
-
-  const onStart = async () => {
+  async function onStart() {
     try {
-      setErrMsg('');
-      setStatus('running');
-      if (!ctlRef.current?.start) {
-        throw new Error('Mic controller not ready. (start is not a function)');
-      }
-      await ctlRef.current.start();
+      setErrMsg("");
+      setStatus("running");
+
+      // stop any prior session
+      await ctlRef.current?.stop?.().catch(() => {});
+      ctlRef.current = null;
+
+      const wsUrl = buildWsUrl();
+
+      // Create a fresh controller for this language pair
+      const ctl = startMicStream(
+        wsUrl,
+        async (m) => {
+          if (m.type === "interim_kr") setKrInterim(m.text);
+          if (m.type === "final_kr") setKrFinal(m.text);
+          if (m.type === "fast_final") {
+            setEn(m.en);
+            // TTS preview via REST (same as your working flow)
+            try {
+              const res = await fetch(`${API}/api/tts`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: m.en, voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D" }),
+              });
+              const blob = await res.blob();
+              const url = URL.createObjectURL(blob);
+              const a = audioRef.current!;
+              a.src = url;
+              await a.play().catch(() => {});
+            } catch (e) {
+              console.error(e);
+            }
+          }
+        },
+        (rms) => setMicRms(rms)
+      );
+
+      ctlRef.current = ctl;
+      await ctl.start();
     } catch (e: any) {
-      setStatus('error');
-      setErrMsg(e?.message ?? 'Could not start microphone/stream.');
+      setStatus("error");
+      setErrMsg(e?.message ?? "Could not start microphone/stream.");
       console.error(e);
     }
-  };
+  }
 
-  const onStop = async () => {
+  async function onStop() {
     try {
       await ctlRef.current?.stop?.();
-      setStatus('stopped');
-    } catch {
-      // ignore
-    }
-  };
+      setStatus("stopped");
+    } catch {}
+  }
 
-  // mic level width (0–1 -> 0–100%)
   const micPct = Math.max(0, Math.min(1, micRms)) * 100;
 
   return (
     <div className="min-h-screen bg-gray-50">
       <div className="mx-auto max-w-6xl px-4 py-8">
-        <header className="mb-6 flex items-center justify-between">
+        <header className="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <h1 className="text-2xl font-semibold text-gray-900">
-            Live Worship Translation (Google STT → Translate → TTS)
+            Live Worship Translation
           </h1>
-          <div className="flex gap-2">
-            <button
-              onClick={onStart}
-              className="rounded-xl bg-emerald-600 px-4 py-2 text-white shadow hover:bg-emerald-700 active:bg-emerald-800 disabled:opacity-50"
-              disabled={status === 'running'}
+
+          {/* Language selectors */}
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="text-sm text-gray-600">Source (STT)</label>
+            <select
+              className="rounded-md border px-2 py-1"
+              value={srcIdx}
+              onChange={(e) => setSrcIdx(Number(e.target.value))}
             >
-              Start
-            </button>
-            <button
-              onClick={onStop}
-              className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
+              {LANGS.map((l, i) => (
+                <option value={i} key={l.stt}>{l.label} – {l.stt}</option>
+              ))}
+            </select>
+
+            <label className="text-sm text-gray-600">Target (Translate)</label>
+            <select
+              className="rounded-md border px-2 py-1"
+              value={dstIdx}
+              onChange={(e) => setDstIdx(Number(e.target.value))}
             >
-              Stop
-            </button>
+              {LANGS.map((l, i) => (
+                <option value={i} key={l.tr}>{l.label} – {l.tr}</option>
+              ))}
+            </select>
+
+            <div className="flex gap-2">
+              <button
+                onClick={onStart}
+                className="rounded-xl bg-emerald-600 px-4 py-2 text-white shadow hover:bg-emerald-700 active:bg-emerald-800 disabled:opacity-50"
+                disabled={status === "running"}
+              >
+                Start
+              </button>
+              <button
+                onClick={onStop}
+                className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
+              >
+                Stop
+              </button>
+            </div>
           </div>
         </header>
 
@@ -130,44 +187,49 @@ export default function Live() {
 
         {/* Panels */}
         <div className="grid gap-6 md:grid-cols-2">
-          {/* Left: Korean */}
+          {/* Left: Source language text */}
           <div className="space-y-6">
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">Korean (interim)</div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">
+                Source (interim)
+              </div>
               <div className="min-h-16 whitespace-pre-wrap text-gray-900">
                 {krInterim || <span className="text-gray-400">—</span>}
               </div>
             </section>
 
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">Korean (final)</div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">
+                Source (final)
+              </div>
               <div className="min-h-16 whitespace-pre-wrap font-medium text-gray-900">
                 {krFinal || <span className="text-gray-400">—</span>}
               </div>
             </section>
           </div>
 
-          {/* Right: English */}
+          {/* Right: Target language text + audio */}
           <div className="space-y-6">
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">English (fast final)</div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">
+                Target (fast final)
+              </div>
               <div className="min-h-24 whitespace-pre-wrap text-lg font-semibold text-gray-900">
                 {en || <span className="text-gray-400">—</span>}
               </div>
             </section>
 
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
-              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">Audio Preview</div>
+              <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">
+                Audio Preview
+              </div>
               <audio ref={audioRef} controls className="w-full" />
             </section>
           </div>
         </div>
 
-        {/* Footer note */}
         <p className="mt-8 text-xs text-gray-500">
-          Using <span className="font-medium">Speech-to-Text v2 (global recognizer)</span>,{' '}
-          <span className="font-medium">Cloud Translation v3</span>, and{' '}
-          <span className="font-medium">Cloud Text-to-Speech</span>.
+          Uses Google STT v2 • Cloud Translation v3 • Cloud TTS
         </p>
       </div>
     </div>

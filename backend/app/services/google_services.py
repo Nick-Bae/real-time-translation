@@ -58,6 +58,46 @@ def _glossary_id() -> str:
 # =========================
 # Translate (v3)
 # =========================
+def translate_text_generic(
+    text: str,
+    source_lang: str,       # e.g., "en", "ko"
+    target_lang: str,       # e.g., "ko", "en"
+    use_glossary_if_en: bool = True,
+) -> str:
+    if not text:
+        return ""
+
+    global _translate_client, _glossary_warned
+    _translate_client = _translate_client or translate_v3.TranslationServiceClient()
+
+    parent = _parent_loc()  # projects/.../locations/us-central1 (or your region)
+    req = {
+        "parent": parent,
+        "contents": [text],
+        "mime_type": "text/plain",
+        "source_language_code": source_lang,
+        "target_language_code": target_lang,
+    }
+
+    glossary = _glossary_id()
+    want_glossary = (use_glossary_if_en and target_lang.lower().startswith("en") and bool(glossary))
+    if want_glossary:
+        req["glossary_config"] = {"glossary": f"{parent}/glossaries/{glossary}"}
+
+    try:
+        resp = _translate_client.translate_text(request=req)
+        if getattr(resp, "glossary_translations", None):
+            return resp.glossary_translations[0].translated_text
+        return resp.translations[0].translated_text
+    except (NotFound, InvalidArgument):
+        if want_glossary and not _glossary_warned:
+            logging.error("Translate glossary not available; falling back (glossary=%r parent=%r)", glossary, parent)
+            _glossary_warned = True
+        # retry without glossary
+        req.pop("glossary_config", None)
+        resp = _translate_client.translate_text(request=req)
+        return resp.translations[0].translated_text
+    
 def translate_kr_to_en(text: str, use_glossary: bool = True) -> str:
     """
     Translate ko->en. If a glossary is configured but not found or invalid,
@@ -203,11 +243,9 @@ def stt_kr_from_bytes_sync(content_bytes: bytes, recognizer_id: Optional[str] = 
 def stt_streaming_request_generator(
     pcm16_chunks: Iterable[bytes],
     recognizer_id: Optional[str] = None,
+    src_lang: str = "ko-KR",               # <-- NEW
 ) -> Generator[speech_v2.StreamingRecognizeRequest, None, None]:
-    recognizer = _recognizer_path() if not recognizer_id else (
-        f"{_speech_parent_global()}/recognizers/{recognizer_id}"
-        if "/" not in recognizer_id else recognizer_id
-    )
+    recognizer = _recognizer_path() if recognizer_id is None else f"{_speech_parent_global()}/recognizers/{recognizer_id}"
 
     streaming_config = speech_v2.StreamingRecognitionConfig(
         config=speech_v2.RecognitionConfig(
@@ -216,59 +254,42 @@ def stt_streaming_request_generator(
                 sample_rate_hertz=16000,
                 audio_channel_count=1,
             ),
-            language_codes=["ko-KR"],
+            language_codes=[src_lang],     # <-- use caller’s language
             model="latest_long",
             features=speech_v2.RecognitionFeatures(enable_automatic_punctuation=True),
         ),
         streaming_features=speech_v2.StreamingRecognitionFeatures(interim_results=True),
     )
 
-    # 1) Send config first
-    yield speech_v2.StreamingRecognizeRequest(
-        recognizer=recognizer,
-        streaming_config=streaming_config,
-    )
-
-    # 2) Send audio; log throughput roughly once per second
-    bytes_out = 0
+    yield speech_v2.StreamingRecognizeRequest(recognizer=recognizer, streaming_config=streaming_config)
     for chunk in pcm16_chunks:
         if not chunk:
             continue
-        bytes_out += len(chunk)
-        if bytes_out % (640 * 50) == 0:  # ~1s at 20ms frames
-            logging.info("STT tx total=%d bytes (~%d s)", bytes_out, bytes_out // (640 * 50))
         yield speech_v2.StreamingRecognizeRequest(recognizer=recognizer, audio=chunk)
 
 
 def stt_streaming_transcripts(
     pcm16_chunks: Iterable[bytes],
     recognizer_id: Optional[str] = None,
+    src_lang: str = "ko-KR",               # <-- NEW
 ) -> Iterable[dict]:
-    """
-    Consumes streaming responses; yields dicts:
-      {"type": "interim"|"final", "text": str, "stability": float}
-    """
-    cli = _speech()
-    try:
-        responses = cli.streaming_recognize(
-            requests=stt_streaming_request_generator(pcm16_chunks, recognizer_id)
-        )
-        for resp in responses:
-            for result in resp.results:
-                if not result.alternatives:
-                    continue
-                alt = result.alternatives[0]
-                yield {
-                    "type": "final" if result.is_final else "interim",
-                    "text": alt.transcript,
-                    "stability": getattr(result, "stability", 0.0),
-                }
-    except Aborted as e:
-        # Covers cases like: 409 Max duration of 5 minutes reached for stream.
-        # Let the caller restart a fresh stream.
-        import logging
-        logging.warning("Streaming aborted: %s", e.message or str(e))
+    global _speech_client
+    if _speech_client is None:
+        _speech_client = speech_v2.SpeechClient()
 
+    responses = _speech_client.streaming_recognize(
+        requests=stt_streaming_request_generator(pcm16_chunks, recognizer_id, src_lang=src_lang)
+    )
+    for resp in responses:
+        for result in resp.results:
+            if not result.alternatives:
+                continue
+            alt = result.alternatives[0]
+            yield {
+                "type": "final" if result.is_final else "interim",
+                "text": alt.transcript,
+                "stability": getattr(result, "stability", 0.0),
+            }
 
 # =========================
 # Debug helpers
