@@ -158,7 +158,6 @@ export default function TranslationBox() {
     onVoices();
     window.speechSynthesis.onvoiceschanged = onVoices;
 
-    // Warm-up once on mount
     ensureTTSReady();
 
     // Keep engine alive when tab regains focus (some browsers pause it)
