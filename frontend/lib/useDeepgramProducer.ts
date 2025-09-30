@@ -1,27 +1,51 @@
 // frontend/lib/useDeepgramProducer.ts
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from 'react';
 
-function wsDeepgramURL() {
-  const env = process.env.NEXT_PUBLIC_WS_URL || "";
-  try {
-    if (env.startsWith("ws")) {
-      const u = new URL(env);
-      u.pathname = ""; u.search = ""; u.hash = "";
-      return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram`;
-    }
-  } catch { }
-  const u = new URL(window.location.href);
-  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-  u.pathname = ""; u.search = ""; u.hash = "";
-  return `${u.toString().replace(/\/$/, "")}/ws/stt/deepgram`;
+declare global {
+  interface Window {
+    webkitAudioContext?: typeof AudioContext;
+    // Safari prefix — no `any` needed
+  }
 }
 
-type Status = "idle" | "starting" | "streaming" | "stopped" | "error";
+type Status = 'idle' | 'starting' | 'streaming' | 'stopped' | 'error';
+
+type WsErrorMsg = { type: 'error'; message?: string };
+type WsPartialMsg = { type: 'stt.partial'; text?: string };
+type WsTranslationMsg = { type: 'translation'; payload?: string };
+type WsMessage = WsErrorMsg | WsPartialMsg | WsTranslationMsg;
+
+function isWsMessage(v: unknown): v is WsMessage {
+  return typeof v === 'object' && v !== null && 'type' in v;
+}
+
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  try { return JSON.stringify(err); } catch { return 'Unknown error'; }
+}
+
+function wsDeepgramURL(): string {
+  const env = process.env.NEXT_PUBLIC_WS_URL || '';
+  try {
+    if (env.startsWith('ws')) {
+      const u = new URL(env);
+      u.pathname = ''; u.search = ''; u.hash = '';
+      return `${u.toString().replace(/\/$/, '')}/ws/stt/deepgram`;
+    }
+  } catch {
+    // fall through to build from window
+  }
+  const u = new URL(window.location.href);
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+  u.pathname = ''; u.search = ''; u.hash = '';
+  return `${u.toString().replace(/\/$/, '')}/ws/stt/deepgram`;
+}
 
 export function useDeepgramProducer() {
-  const [status, setStatus] = useState<Status>("idle");
-  const [partial, setPartial] = useState("");
-  const [lastCommit, setLastCommit] = useState("");
+  const [status, setStatus] = useState<Status>('idle');
+  const [partial, setPartial] = useState('');
+  const [lastCommit, setLastCommit] = useState('');       // ✅ keep it
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -30,142 +54,154 @@ export function useDeepgramProducer() {
   const streamRef = useRef<MediaStream | null>(null);
   const keepAliveRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  async function start() {
+  async function start(): Promise<void> {
     try {
-      if (status === "streaming" || status === "starting") return;
-      setStatus("starting");
+      if (status === 'streaming' || status === 'starting') return;
+      setStatus('starting');
       setErrorMsg(null);
 
-      // Secure-context guard (AudioWorklet requirement)
-      const origin = window.location.origin;
-      const isSecure =
-        window.isSecureContext || origin.startsWith("https://") || origin.includes("localhost");
-      if (!isSecure) throw new Error("AudioWorklet requires a secure context (localhost or HTTPS).");
+      // Secure-context guard (required for AudioWorklet)
+      const isSecure = typeof window !== 'undefined' &&
+        (window.isSecureContext ||
+          window.location.origin.startsWith('https://') ||
+          window.location.hostname === 'localhost');
+      if (!isSecure) throw new Error('AudioWorklet requires a secure context (localhost or HTTPS).');
 
-      // AudioContext + Worklet
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
-      ctxRef.current = ctx;
+      // AudioContext + Worklet (typed, no `any`)
+      const ACtor = window.AudioContext ?? window.webkitAudioContext;
+      if (!ACtor) throw new Error('Web Audio API not supported');
+      const ctx = new ACtor({ sampleRate: 48000 });
+      ctxRef.current = ctx as AudioContext;
 
-      await ctx.audioWorklet.addModule("/workers/pcm-worklet-processor.js");
+      await ctx.audioWorklet.addModule('/workers/pcm-worklet-processor.js');
+      // ^ ensure this path & worklet name match your worklet file’s `registerProcessor` name
 
-      // mic
+      // Mic
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, sampleRate: 48000, echoCancellation: true, noiseSuppression: true, autoGainControl: false }
+        audio: {
+          channelCount: 1,
+          sampleRate: 48000,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: false,
+        },
       });
       streamRef.current = stream;
 
-      // nodes all on the SAME ctx
-      const src = ctx.createMediaStreamSource(stream);
+      const src = (ctx as AudioContext).createMediaStreamSource(stream);
 
-      const workletNode = new AudioWorkletNode(ctx, "pcm16-worklet", {
+      // This name must match your processor registration (e.g., "pcm-worklet" or "pcm16-worklet")
+      const workletName = 'pcm-worklet';
+      const workletNode = new AudioWorkletNode(ctx as AudioContext, workletName, {
         numberOfInputs: 1,
-        numberOfOutputs: 0,       // no outputs
+        numberOfOutputs: 0,
         channelCount: 1,
-        channelCountMode: "explicit",
-        channelInterpretation: "speakers",
+        channelCountMode: 'explicit',
+        channelInterpretation: 'speakers',
       });
 
-      // --- wiring ---
-      // DO NOT: workletNode.connect(...)
-      // mic -> worklet (for processing/port messages)
+      // Wiring
       src.connect(workletNode);
 
-      // mic -> silent sink to keep graph alive
+      // Silent sink to keep the graph alive
       const sink = ctx.createGain();
       sink.gain.value = 0;
       src.connect(sink);
       sink.connect(ctx.destination);
 
-      // expose port
       portRef.current = workletNode.port;
 
-      if (ctx.state === "suspended") await ctx.resume();
-
+      if (ctx.state === 'suspended') await ctx.resume();
 
       // WebSocket
       const url = wsDeepgramURL();
       const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
+      ws.binaryType = 'arraybuffer';
 
       ws.onopen = () => {
-        console.log('WS open:', ws!.url);
-        workletNode!.port.onmessage = (ev) => {
-          const msg = ev.data;
-          if (msg && typeof msg === 'object' && !(msg instanceof ArrayBuffer)) {
-            if ((msg as any).dbg) console.log('worklet dbg:', (msg as any).dbg);
+        setStatus('streaming');
+
+        // Send PCM frames from worklet to WS
+        portRef.current!.onmessage = (evt: MessageEvent<ArrayBuffer | { rms?: number; dbg?: unknown }>) => {
+          const data = evt.data;
+          if (data && typeof data === 'object' && !(data instanceof ArrayBuffer)) {
+            // handle {rms, dbg} objects if your worklet sends them; otherwise ignore
             return;
           }
-          const buf = msg as ArrayBuffer;
-          console.log('TX -> WS bytes:', buf.byteLength);  // <— add this
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(buf);
+          if (ws.readyState === WebSocket.OPEN) ws.send(data as ArrayBuffer);
         };
-        setStatus("streaming");
 
-        // keep the server stream from idling out when you're quiet
+        // Keep-alive (optional): send tiny silence buffers to prevent idle timeouts
         if (!keepAliveRef.current) {
           keepAliveRef.current = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(new ArrayBuffer(640)); // ~20ms silence @16kHz mono 16-bit (320 samples * 2 bytes)
+              ws.send(new ArrayBuffer(320)); // ~10ms @ 16kHz mono 16-bit (160 samples * 2 bytes); adjust to your server expectation
             }
           }, 2000);
         }
-
-        // Pipe worker -> WS (handle rms/debug objects vs ArrayBuffers)
-        portRef.current!.onmessage = (evt: MessageEvent) => {
-          const data = evt.data;
-          if (data && typeof data === "object" && !(data instanceof ArrayBuffer)) {
-            // { dbg?: {sentKB}, rms?: number }
-            if (data.rms != null) {
-              // you can lift an onRms callback into this hook if you want to expose mic level
-              // e.g., setMicRms(data.rms)
-            }
-            return;
-          }
-          if (ws.readyState === WebSocket.OPEN) ws.send(data); // PCM16 @ 16k from your worker
-        };
       };
 
       ws.onclose = () => {
-        setStatus("stopped");
+        setStatus('stopped');
       };
       ws.onerror = () => {
-        setErrorMsg("WebSocket error");
-        setStatus("error");
+        setErrorMsg('WebSocket error');
+        setStatus('error');
       };
-      ws.onmessage = (e) => {
+      ws.onmessage = (e: MessageEvent<string | ArrayBuffer>) => {
+        if (typeof e.data !== 'string') return; // parse text frames only
         try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === "error") {
-            setErrorMsg(msg.message || "Server error");
-            return;
+          const parsed: unknown = JSON.parse(e.data);
+          if (!isWsMessage(parsed)) return;
+          switch (parsed.type) {
+            case 'error':
+              setErrorMsg(parsed.message ?? 'Server error');
+              break;
+            case 'stt.partial':
+              setPartial(parsed.text ?? '');
+              break;
+            case 'translation':
+              setLastCommit(parsed.payload ?? '');
+              break;
           }
-          if (msg.type === "stt.partial") setPartial(msg.text || "");
-          if (msg.type === "translation") setLastCommit(msg.payload || "");
         } catch {
-          /* ignore non-JSON */
+          /* ignore malformed frames */
         }
       };
 
       wsRef.current = ws;
-    } catch (err: any) {
-      setErrorMsg(err?.message || String(err));
-      setStatus("error");
+    } catch (err: unknown) {
+      setErrorMsg(errorMessage(err));
+      setStatus('error');
     }
   }
 
-  function stop() {
+  function stop(): void {
     try {
-      if (keepAliveRef.current) { clearInterval(keepAliveRef.current); keepAliveRef.current = null; }
-      wsRef.current?.close(); wsRef.current = null;
-      portRef.current?.close?.(); portRef.current = null;
-      ctxRef.current?.close(); ctxRef.current = null;
+      if (keepAliveRef.current) {
+        clearInterval(keepAliveRef.current);
+        keepAliveRef.current = null;
+      }
+      wsRef.current?.close();
+      wsRef.current = null;
+
+      portRef.current?.close?.();
+      portRef.current = null;
+
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
+
+      ctxRef.current?.close();
+      ctxRef.current = null;
     } finally {
-      setStatus("stopped");
-      setPartial("");
+      setStatus('stopped');
+      setPartial('');
+      setLastCommit('');
     }
   }
+
+  // Cleanup on unmount
+  useEffect(() => stop, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return { status, partial, lastCommit, errorMsg, start, stop };
 }

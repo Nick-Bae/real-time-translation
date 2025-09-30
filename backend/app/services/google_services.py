@@ -10,6 +10,9 @@ from google.cloud import speech_v2, translate_v3, texttospeech
 from google.api_core.exceptions import Aborted, NotFound, InvalidArgument
 from google.api_core import exceptions
 
+import google.auth
+from google.oauth2 import service_account
+
 # ---- Load backend/.env explicitly ----
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(dotenv_path=str(ENV_PATH), override=True)
@@ -26,6 +29,17 @@ _translate_client: Optional[translate_v3.TranslationServiceClient] = None
 _tts_client: Optional[texttospeech.TextToSpeechClient] = None
 _speech_client: Optional[speech_v2.SpeechClient] = None
 
+
+# Old: hard-stop if env var missing
+# raise RuntimeError("Missing env var GOOGLE_APPLICATION_CREDENTIALS...")
+
+def get_google_credentials(scopes=None):
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path:  # local/dev key file
+        return service_account.Credentials.from_service_account_file(path, scopes=scopes)
+    # Cloud Run / GCP: use Workload Identity (no file)
+    creds, _ = google.auth.default(scopes=scopes)
+    return creds
 
 # =========================
 # Env / Resource helpers

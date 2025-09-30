@@ -8,6 +8,8 @@ import pathlib
 import threading, time
 from typing import Deque, Iterable, Optional
 from collections import deque
+import google.auth
+from google.oauth2 import service_account
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File  # <-- FIXED
@@ -18,12 +20,17 @@ from asyncio import CancelledError
 from typing import Set
 from starlette.websockets import WebSocketState
 from urllib.parse import parse_qs
+from rapidfuzz import fuzz, process
+import unicodedata
+import re
 
 # Local modules
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
 from app.utils.translate import translate_text
 from app.routes import translate as translate_routes
+from app.routes import hybrid as hybrid_routes
+from app.hybrid_store import match_and_translate 
 from app.services.google_services import (
     stt_kr_from_bytes_sync,
     translate_kr_to_en,
@@ -57,27 +64,55 @@ load_dotenv(dotenv_path=ENV_PATH, override=True)
 debug_log_speech_paths()
 
 # Hard fail early if creds file missing
-creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or ""
-if not creds_path or not os.path.exists(creds_path):
-    raise RuntimeError(f"Creds file not found at {creds_path}. Fix backend/.env or path.")
+creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+print("GOOGLE_APPLICATION_CREDENTIALS:", creds_path)
+
+# If a path is set but not found, just warn and fall back to ADC.
+if creds_path and not os.path.exists(creds_path):
+    print(f"[auth] Warning: creds file not found at {creds_path}. Falling back to ADC.")
+
 
 # ------------------------------------------------------------------------------
 # FastAPI setup
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Real-Time Translation Backend", version="1.0.0")
+PROD_ORIGINS = [
+    "https://worshiptranslate.com",
+    "https://www.worshiptranslate.com",
+    # keep localhost for dev; drop if you don't need it
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# allow all preview deployments on vercel (e.g. https://foo-bar-123.vercel.app)
+VERCEL_PREVIEW_REGEX = r"https://.*\.vercel\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # relax for dev; tighten for prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=PROD_ORIGINS,          # explicit origins only (no "*")
+    allow_origin_regex=VERCEL_PREVIEW_REGEX,  # previews
+    allow_credentials=True,              # only works with explicit origins
+    allow_methods=["GET", "POST", "OPTIONS"], # tighten to what you actually use
+    allow_headers=["Authorization", "Content-Type"],  # add others if truly needed
+    max_age=86400,                       # cache preflight for 24h
 )
 
 # Keep your existing HTTP routes under /api
 app.include_router(translate_routes.router, prefix="/api")
+app.include_router(hybrid_routes.router,    prefix="/api")  # <-- add this
 
 VIEWERS: Set[WebSocket] = set()
 VIEWERS_LOCK = asyncio.Lock()
+
+def get_google_credentials(scopes=None):
+    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if path:
+        try:
+            return service_account.Credentials.from_service_account_file(path, scopes=scopes)
+        except Exception as e:
+            print(f"[auth] Could not load creds from {path}: {e}. Falling back to ADC.")
+    creds, _ = google.auth.default(scopes=scopes)  # ADC on Cloud Run
+    return creds
 
 async def broadcast(payload: dict):
     """Send a JSON payload to all connected viewers (best-effort)."""
@@ -98,6 +133,11 @@ async def broadcast(payload: dict):
 @app.get("/")
 def root():
     return {"ok": True, "msg": "server is live"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
 
 # Example body model if you need it later
 class KRIn(BaseModel):
@@ -232,12 +272,23 @@ async def ws_translate(ws: WebSocket):
                     await broadcast(payload_final)
 
                     # Translate into selected target language
-                    dst_text = translate_text_generic(
-                        src_text, source_lang=src_tr, target_lang=dst_tr
-                    )
-                    payload_fast = {"type": "fast_final", "en": dst_text, "from": "google", "dst": dst_tr}
+                    # Hybrid: try script match, else Google translate
+                    hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
+                    dst_text = hyb["text"]
+                    origin = hyb["origin"]        # "script" or "rt"
+                    score = hyb["score"]          # similarity (0..1)
+
+                    payload_fast = {
+                        "type": "fast_final",
+                        "en": dst_text,
+                        "from": "google",
+                        "dst": dst_tr,
+                        "origin": origin,         # NEW
+                        "score": round(score, 4), # NEW
+                    }
                     await ws.send_json(payload_fast)
                     await broadcast(payload_fast)
+
         except Exception as e:
             if "timed out after receiving no more client requests" in str(e).lower():
                 logger.warning("Streaming aborted: %s", e)
@@ -322,28 +373,31 @@ async def ws_stt_deepgram(websocket: WebSocket):
             nonlocal seq, pending_kr, pending_task
             if not kr_text or not kr_text.strip():
                 return
-            # de-dup repeated finals
             if norm_ws(kr_text) == norm_ws(getattr(commit_now, "_last_kr", "")):
                 return
             setattr(commit_now, "_last_kr", kr_text)
 
             seq += 1
             src_text = kr_text
-            try:
-                en = await translate_text(src_text, "ko", "en")
-            except Exception as e:
-                print("[TX] error:", e)
-                en = src_text  # fail-open
 
-            print(f"[A] FINAL seq={seq} KR='{src_text}' → EN='{en}'")
+            # Hybrid: script match first, else RT translate (using your translate_text_generic under the hood)
+            hyb = await match_and_translate(src_text, target_lang="en")
+            en = hyb["text"]
+            origin = hyb["origin"]
+            score = round(hyb["score"], 4)
 
-            # shape your client already supports
+            print(f"[A][HYBRID] FINAL seq={seq} origin={origin} score={score} "
+                f"KR='{src_text}' → EN='{en}'")
+
+            # Back-compatible payloads + origin/score
             live_msg_new = {
                 "mode": "live",
                 "text": en,
                 "seq": seq,
                 "src": {"text": src_text, "lang": "ko"},
                 "tgt": {"lang": "en"},
+                "origin": origin,      # NEW
+                "score": score,        # NEW
             }
             live_msg_legacy = {
                 "type": "translation",
@@ -355,6 +409,8 @@ async def ws_stt_deepgram(websocket: WebSocket):
                     "segment_id": seq,
                     "rev": 0,
                     "seq": seq,
+                    "origin": origin,  # NEW
+                    "score": score,    # NEW
                 },
             }
 
@@ -367,7 +423,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             try:
                 await manager.broadcast(live_msg_new)
                 await manager.broadcast(live_msg_legacy)
-                print(f"[BROADCAST] seq={seq} '{en[:60]}'")
+                print(f"[BROADCAST] seq={seq} origin={origin} score={score} '{en[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
 
@@ -375,6 +431,7 @@ async def ws_stt_deepgram(websocket: WebSocket):
             if pending_task and not pending_task.done():
                 pending_task.cancel()
             pending_task = None
+
 
         async def arm_timer():
             nonlocal pending_task

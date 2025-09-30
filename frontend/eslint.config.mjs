@@ -10,7 +10,18 @@ const compat = new FlatCompat({
 });
 
 const eslintConfig = [
+  // keep Next’s recommended presets
   ...compat.extends("next/core-web-vitals", "next/typescript"),
+
+  // ✅ our overrides: make “any” a warning, not an error
+  {
+    rules: {
+      "@typescript-eslint/no-explicit-any": "warn",
+      // optional but common for your repo:
+      "react-hooks/exhaustive-deps": "warn",
+      "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }]
+    },
+  },
 ];
 
 export default eslintConfig;

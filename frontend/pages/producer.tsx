@@ -1,6 +1,36 @@
 // frontend/pages/producer.tsx
 import { useRef, useState } from "react";
 
+declare global {
+  interface Window {
+    webkitAudioContext?: typeof AudioContext;
+  }
+}
+
+// Messages you expect from the server
+type WsErrorMsg = { type: 'error'; message?: string };
+type WsPartialMsg = { type: 'stt.partial'; text?: string };
+type WsTranslationMsg = { type: 'translation'; payload?: string };
+
+type WsMessage = WsErrorMsg | WsPartialMsg | WsTranslationMsg;
+
+// Type guard for parsed JSON
+function isWsMessage(v: unknown): v is WsMessage {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    'type' in v &&
+    typeof (v as { type: unknown }).type === 'string'
+  );
+}
+
+// Safe error -> string
+function errorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  try { return JSON.stringify(err); } catch { return 'Unknown error'; }
+}
+
 function wsDeepgramURL() {
   const env = process.env.NEXT_PUBLIC_WS_URL || "";
   try {
@@ -27,50 +57,81 @@ export default function Producer() {
   const ctxRef = useRef<AudioContext|null>(null);
   const streamRef = useRef<MediaStream|null>(null);
 
-  async function start() {
-    try {
-      if (status === "streaming") return;
-      setStatus("starting"); setErrorMsg(null);
+  async function start(): Promise<void> {
+  try {
+    if (status === 'streaming') return;
+    setStatus('starting');
+    setErrorMsg(null);
 
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 48000 });
-      ctxRef.current = ctx;
-      await ctx.audioWorklet.addModule("/workers/pcm-worklet-processor.js");
+    // AudioContext (typed, no `any`)
+    const ACtor = window.AudioContext ?? window.webkitAudioContext;
+    if (!ACtor) throw new Error('Web Audio API not supported');
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      });
-      streamRef.current = stream;
+    const ctx = new ACtor({ sampleRate: 48000 });
+    ctxRef.current = ctx as AudioContext; // both are structurally compatible
 
-      const src = ctx.createMediaStreamSource(stream);
-      // @ts-ignore
-      const worklet = new AudioWorkletNode(ctx, "pcm-worklet", { numberOfInputs: 1, numberOfOutputs: 0 });
-      src.connect(worklet);
-      portRef.current = worklet.port;
+    // Worklet
+    await ctx.audioWorklet.addModule('/workers/pcm-worklet-processor.js');
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    streamRef.current = stream;
 
-      const url = wsDeepgramURL();
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
-      ws.onopen = () => setStatus("streaming");
-      ws.onclose  = () => setStatus("stopped");
-      ws.onerror  = () => { setErrorMsg("WebSocket error"); setStatus("error"); };
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === "error") { setErrorMsg(msg.message || "Server error"); return; }
-          if (msg.type === "stt.partial") setPartial(msg.text || "");
-          if (msg.type === "translation") setLastCommit(msg.payload || "");
-        } catch {}
-      };
-      wsRef.current = ws;
+    const src = (ctx as AudioContext).createMediaStreamSource(stream);
+    const worklet = new AudioWorkletNode(ctx as AudioContext, 'pcm-worklet', {
+      numberOfInputs: 1,
+      numberOfOutputs: 0,
+    });
+    src.connect(worklet);
+    portRef.current = worklet.port;
 
-      portRef.current.onmessage = (evt: MessageEvent) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(evt.data); // 16-bit PCM @ 48k
-      };
-    } catch (err: any) {
-      setErrorMsg(err?.message || String(err));
-      setStatus("error");
-    }
+    // WebSocket
+    const url = wsDeepgramURL();
+    const ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => setStatus('streaming');
+    ws.onclose = () => setStatus('stopped');
+    ws.onerror = () => {
+      setErrorMsg('WebSocket error');
+      setStatus('error');
+    };
+
+    ws.onmessage = (e: MessageEvent<string | ArrayBuffer>) => {
+      try {
+        if (typeof e.data !== 'string') return; // we only JSON-parse text frames
+        const parsed: unknown = JSON.parse(e.data);
+        if (!isWsMessage(parsed)) return;
+
+        switch (parsed.type) {
+          case 'error':
+            setErrorMsg(parsed.message ?? 'Server error');
+            return;
+          case 'stt.partial':
+            setPartial(parsed.text ?? '');
+            return;
+          case 'translation':
+            setLastCommit(parsed.payload ?? '');
+            return;
+        }
+      } catch {
+        /* ignore malformed frames */
+      }
+    };
+
+    wsRef.current = ws;
+
+    // AudioWorklet -> WS (PCM 16-bit frames). Type the message as ArrayBuffer.
+    portRef.current.onmessage = (evt: MessageEvent<ArrayBuffer>) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(evt.data);
+      }
+    };
+  } catch (err: unknown) {
+    setErrorMsg(errorMessage(err));   // ✅ no `any`
+    setStatus('error');
   }
+}
 
   function stop() {
     try {

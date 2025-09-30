@@ -7,10 +7,10 @@ import { startMicStream } from "../lib/useMicTranslate";
 type Lang = { label: string; stt: string; tr: string };
 
 const LANGS: Lang[] = [
-  { label: "Korean",  stt: "ko-KR",  tr: "ko" },
+  { label: "Korean", stt: "ko-KR", tr: "ko" },
   { label: "English", stt: "en-US", tr: "en" },
   { label: "Spanish", stt: "es-ES", tr: "es" },
-  { label: "Japanese",stt: "ja-JP", tr: "ja" },
+  { label: "Japanese", stt: "ja-JP", tr: "ja" },
   { label: "Chinese (CMN)", stt: "cmn-Hans-CN", tr: "zh" },
 ];
 
@@ -42,6 +42,16 @@ export default function Live() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const ctlRef = useRef<ReturnType<typeof startMicStream> | null>(null);
 
+  function errorMessage(err: unknown): string {
+    if (err instanceof Error) return err.message;
+    if (typeof err === 'string') return err;
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return 'Unknown error';
+    }
+  }
+
   // Build a WS URL with role + chosen languages + voice
   function buildWsUrl() {
     const src = LANGS[srcIdx];
@@ -59,37 +69,38 @@ export default function Live() {
 
   async function onStart() {
     try {
-      setErrMsg("");
-      setStatus("running");
+      setErrMsg('');
+      setStatus('running');
 
-      // stop any prior session
-      await ctlRef.current?.stop?.().catch(() => {});
+      await ctlRef.current?.stop?.().catch(() => { });
       ctlRef.current = null;
 
       const wsUrl = buildWsUrl();
 
-      // Create a fresh controller for this language pair
       const ctl = startMicStream(
         wsUrl,
         async (m) => {
-          if (m.type === "interim_kr") setKrInterim(m.text);
-          if (m.type === "final_kr") setKrFinal(m.text);
-          if (m.type === "fast_final") {
+          if (m.type === 'interim_kr') setKrInterim(m.text);
+          if (m.type === 'final_kr') setKrFinal(m.text);
+          if (m.type === 'fast_final') {
             setEn(m.en);
-            // TTS preview via REST (same as your working flow)
             try {
               const res = await fetch(`${API}/api/tts`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: m.en, voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D" }),
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  text: m.en,
+                  voice: VOICE_BY_TR[LANGS[dstIdx].tr] || 'en-US-Wavenet-D',
+                }),
               });
+              if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
               const blob = await res.blob();
               const url = URL.createObjectURL(blob);
               const a = audioRef.current!;
               a.src = url;
-              await a.play().catch(() => {});
-            } catch (e) {
-              console.error(e);
+              await a.play().catch(() => { });
+            } catch (err) {
+              console.error(err);
             }
           }
         },
@@ -98,18 +109,18 @@ export default function Live() {
 
       ctlRef.current = ctl;
       await ctl.start();
-    } catch (e: any) {
-      setStatus("error");
-      setErrMsg(e?.message ?? "Could not start microphone/stream.");
-      console.error(e);
+    } catch (err: unknown) {
+      setStatus('error');
+      setErrMsg(errorMessage(err)); // ✅ properly narrowed
+      console.error(err);
     }
-  }
+  } 
 
   async function onStop() {
     try {
       await ctlRef.current?.stop?.();
       setStatus("stopped");
-    } catch {}
+    } catch { }
   }
 
   const micPct = Math.max(0, Math.min(1, micRms)) * 100;

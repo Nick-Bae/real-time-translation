@@ -5,7 +5,7 @@ import { useSubtitleSocket } from "../utils/useSubtitleSocket";
 export default function Display() {
   const {
     connected,
-    krInterim,   // if you want to show a faint preview
+    // krInterim,    if you want to show a faint preview
     krLines,
     enLines,
   } = useSubtitleSocket(

@@ -21,7 +21,7 @@ const availableLanguages = [
 ]
 
 export default function TranslationBox() {
-  const { connected, last, sendProducerText } = useTranslationSocket({ isProducer: true });
+  const { connected, last } = useTranslationSocket({ isProducer: true });
 
   // UI state
   const [text, setText] = useState('')
