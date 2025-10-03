@@ -39,7 +39,7 @@ from app.services.google_services import (
     stt_streaming_transcripts,
     debug_log_speech_paths,
     ensure_global_recognizer,
-    translate_text_generic
+    # translate_text_generic
 )
 
 
