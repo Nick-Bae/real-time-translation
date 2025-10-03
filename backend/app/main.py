@@ -182,6 +182,8 @@ async def ws_translate(ws: WebSocket):
     await ws.accept()
     logger.info("WS connected: role=%s src=%s dst=%s voice=%s", role, src_stt, dst_tr, voice)
 
+    seq = 0
+     
     # If this is a viewer, just register and keep the connection open
     if role.lower() == "viewer":
         async with VIEWERS_LOCK:
@@ -253,41 +255,49 @@ async def ws_translate(ws: WebSocket):
     worker.start()
 
     async def stt_consumer():
+        nonlocal seq  # <-- ADD THIS LINE
         logger.info("STT supervisor started")
         try:
-            src_tr = (src_stt.split("-")[0] or "ko").lower()  # "ko-KR" -> "ko"
+            src_tr = (src_stt.split("-")[0] or "ko").lower()
             while True:
                 msg = await stt_out.get()
                 if msg.get("type") == "__stt_done__":
                     break
 
                 if msg["type"] == "interim":
-                    payload = {"type": "interim_kr", "text": msg["text"]}
+                    # optional: preview the upcoming seq
+                    preview_seq = seq + 1
+                    payload = {"type": "interim_kr", "text": msg["text"], "seq": preview_seq}
                     await ws.send_json(payload)
                     await broadcast(payload)
-                else:
-                    src_text = msg["text"].strip()
-                    payload_final = {"type": "final_kr", "text": src_text}
-                    await ws.send_json(payload_final)
-                    await broadcast(payload_final)
+                    continue
 
-                    # Translate into selected target language
-                    # Hybrid: try script match, else Google translate
-                    hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
-                    dst_text = hyb["text"]
-                    origin = hyb["origin"]        # "script" or "rt"
-                    score = hyb["score"]          # similarity (0..1)
+                # final → commit
+                src_text = (msg.get("text") or "").strip()
+                if not src_text:
+                    continue
 
-                    payload_fast = {
-                        "type": "fast_final",
-                        "en": dst_text,
-                        "from": "google",
-                        "dst": dst_tr,
-                        "origin": origin,         # NEW
-                        "score": round(score, 4), # NEW
-                    }
-                    await ws.send_json(payload_fast)
-                    await broadcast(payload_fast)
+                seq += 1                # advance ON COMMIT
+                curr = seq              # freeze this value for this sentence
+
+                payload_final = {"type": "final_kr", "text": src_text, "seq": curr}
+                await ws.send_json(payload_final)
+                await broadcast(payload_final)
+
+                hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
+                dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
+
+                payload_fast = {
+                    "type": "fast_final",
+                    "en": dst_text,
+                    "from": "google",
+                    "dst": dst_tr,
+                    "origin": origin,
+                    "score": score,
+                    "seq": curr,         # same seq as final_kr
+                }
+                await ws.send_json(payload_fast)
+                await broadcast(payload_fast)
 
         except Exception as e:
             if "timed out after receiving no more client requests" in str(e).lower():

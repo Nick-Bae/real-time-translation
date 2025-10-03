@@ -3,8 +3,18 @@
 
 import { useRef, useState } from "react";
 import { startMicStream } from "../lib/useMicTranslate";
+import { useAudioQueue } from "../lib/useAudioQueue";
 
 type Lang = { label: string; stt: string; tr: string };
+type FastFinalMsg = {
+  type: "fast_final";
+  en: string;
+  from: "google";
+  dst?: string;
+  origin?: string;
+  score?: number;
+  seq?: number;   // ← optional
+};
 
 const LANGS: Lang[] = [
   { label: "Korean", stt: "ko-KR", tr: "ko" },
@@ -41,6 +51,8 @@ export default function Live() {
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const ctlRef = useRef<ReturnType<typeof startMicStream> | null>(null);
+  const { enqueue, clear } = useAudioQueue(audioRef);
+  const seqRef = useRef<number>(1); // local sequence to preserve order
 
   function errorMessage(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -82,23 +94,24 @@ export default function Live() {
         async (m) => {
           if (m.type === 'interim_kr') setKrInterim(m.text);
           if (m.type === 'final_kr') setKrFinal(m.text);
-          if (m.type === 'fast_final') {
-            setEn(m.en);
+          if (m.type === "fast_final") {
+            const ff = m as FastFinalMsg; // narrow
+            setEn(ff.en);
+
             try {
               const res = await fetch(`${API}/api/tts`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  text: m.en,
-                  voice: VOICE_BY_TR[LANGS[dstIdx].tr] || 'en-US-Wavenet-D',
+                  text: ff.en,
+                  voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
                 }),
               });
               if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
               const blob = await res.blob();
-              const url = URL.createObjectURL(blob);
-              const a = audioRef.current!;
-              a.src = url;
-              await a.play().catch(() => { });
+
+              const backendSeq = typeof ff.seq === "number" ? ff.seq : undefined;
+              enqueue({ blob, seq: backendSeq });
             } catch (err) {
               console.error(err);
             }
@@ -114,7 +127,7 @@ export default function Live() {
       setErrMsg(errorMessage(err)); // ✅ properly narrowed
       console.error(err);
     }
-  } 
+  }
 
   async function onStop() {
     try {
@@ -170,6 +183,13 @@ export default function Live() {
                 className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
               >
                 Stop
+              </button>
+              {/* Optional: emergency flush button */}
+              <button
+                onClick={() => clear()}
+                className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
+              >
+                Flush Queue
               </button>
             </div>
           </div>
