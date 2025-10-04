@@ -266,8 +266,8 @@ async def ws_translate(ws: WebSocket):
 
                 if msg["type"] == "interim":
                     # optional: preview the upcoming seq
-                    preview_seq = seq + 1
-                    payload = {"type": "interim_kr", "text": msg["text"], "seq": preview_seq}
+                    # preview_seq = seq + 1
+                    payload = {"type": "interim_kr", "text": msg["text"]}
                     await ws.send_json(payload)
                     await broadcast(payload)
                     continue
@@ -298,6 +298,17 @@ async def ws_translate(ws: WebSocket):
                 }
                 await ws.send_json(payload_fast)
                 await broadcast(payload_fast)
+                
+                live_msg_new = {
+                    "mode": "live",
+                    "text": dst_text,                 # what your viewer hook reads
+                    "seq": curr,
+                    "src": {"text": src_text, "lang": src_tr},
+                    "tgt": {"lang": dst_tr},
+                    "origin": origin,
+                    "score": score,
+                }
+                await broadcast(live_msg_new)
 
         except Exception as e:
             if "timed out after receiving no more client requests" in str(e).lower():
