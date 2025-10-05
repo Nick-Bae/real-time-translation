@@ -1,7 +1,7 @@
 # backend/app/services/google_services.py
 from __future__ import annotations
 
-import os, logging, time
+import os, logging, time, grpc
 from pathlib import Path
 from typing import Iterable, Generator, Dict, Any, Optional
 
@@ -290,7 +290,7 @@ def stt_streaming_transcripts(
     pcm16_chunks: Iterable[bytes],
     recognizer_id: Optional[str] = None,
     src_lang: str = "ko-KR",
-    window_seconds: int = 270,          # ~4m30s to stay under the 5-min hard cap
+    window_seconds: int = 270,          # ~4m30s to stay under Google's ~5m cap
 ) -> Iterable[dict]:
     """
     Endless streaming recognizer that auto-rotates every `window_seconds`.
@@ -310,14 +310,14 @@ def stt_streaming_transcripts(
     )
 
     def _one_window_requests():
-        """Generator for one streaming window: first config, then audio frames until time limit."""
+        """One streaming window: first config, then audio frames until time limit."""
         start_ts = time.time()
 
         streaming_config = speech_v2.StreamingRecognitionConfig(
             config=speech_v2.RecognitionConfig(
                 explicit_decoding_config=speech_v2.ExplicitDecodingConfig(
                     encoding=speech_v2.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=16000,
+                    sample_rate_hertz=16000,   # MUST match your input frames
                     audio_channel_count=1,
                 ),
                 language_codes=[src_lang],
@@ -332,19 +332,45 @@ def stt_streaming_transcripts(
             recognizer=recognizer, streaming_config=streaming_config
         )
 
-        # Then the audio stream (stop at window_seconds)
+        # Then audio frames until the window time elapses
         for chunk in pcm16_chunks:
             if not chunk:
                 continue
             yield speech_v2.StreamingRecognizeRequest(recognizer=recognizer, audio=chunk)
             if time.time() - start_ts >= window_seconds:
-                return  # end this window; outer loop will start a fresh one
+                return  # end this window; outer loop will roll over
 
     try:
         while True:
             try:
                 responses = _speech_client.streaming_recognize(requests=_one_window_requests())
-                for resp in responses:
+
+                # Pull first response eagerly to surface startup RPC errors with details
+                try:
+                    first = next(responses)
+                except StopIteration:
+                    # No results this window (silence etc.) -> still roll over
+                    yield ROLL_SIGNAL
+                    continue
+                except grpc.RpcError as e:
+                    code = getattr(e, "code", lambda: None)()
+                    details = getattr(e, "details", lambda: "")()
+                    logging.error("STT RPC error (on first): code=%s details=%r",
+                                  getattr(code, "name", code), details)
+                    # Treat ABORTED/5-min as a rollover; others propagate/backoff
+                    if (getattr(code, "name", None) == "ABORTED"
+                        or "Max duration of 5 minutes" in str(details)):
+                        yield ROLL_SIGNAL
+                        continue
+                    raise
+
+                # Iterate the first + the rest
+                def _iter_all():
+                    yield first
+                    for r in responses:
+                        yield r
+
+                for resp in _iter_all():
                     for result in resp.results:
                         if not result.alternatives:
                             continue
@@ -368,15 +394,34 @@ def stt_streaming_transcripts(
                 else:
                     logging.exception("STT Aborted: %s", e)
                     time.sleep(0.5)
+
+            except grpc.RpcError as e:
+                code = getattr(e, "code", lambda: None)()
+                details = getattr(e, "details", lambda: "")()
+                name = getattr(code, "name", code)
+                logging.error("STT RPC error: code=%s details=%r", name, details)
+
+                # Explicit handling so you see the real cause in logs
+                if name == "ABORTED" or "Max duration of 5 minutes" in str(details):
+                    yield ROLL_SIGNAL
+                elif name in ("UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT", "NOT_FOUND"):
+                    # Fatal config/auth problems: surface so you fix IAM, recognizer, sample rate, etc.
+                    raise
+                elif name in ("RESOURCE_EXHAUSTED",):
+                    time.sleep(1.0)  # brief backoff then continue
+                else:
+                    time.sleep(0.5)
+
             except Exception as e:
                 logging.exception("STT window error: %s", e)
                 time.sleep(0.5)
 
-            # Loop immediately to start a fresh window and keep consuming pcm16_chunks
+            # Loop: start a fresh window and continue consuming pcm16_chunks
 
     finally:
         # Upstream ended; let consumer exit cleanly
         yield DONE_SIGNAL
+
 
 # =========================
 # Debug helpers

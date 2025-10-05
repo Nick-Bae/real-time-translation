@@ -240,14 +240,14 @@ async def ws_translate(ws: WebSocket):
         try:
             for msg in stt_streaming_transcripts(
                 pcm_iter_sync(),
-                src_lang=src_stt,          # <-- use the caller's language (e.g., "ko-KR")
-                # window_seconds=270,       # optional override
+                src_lang=src_stt,   # <-- add this
             ):
                 asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
         except Exception as e:
             logger.error("STT worker error: %s", e, exc_info=True)
         finally:
             asyncio.run_coroutine_threadsafe(stt_out.put({"type": "__stt_done__"}), loop)
+
 
     worker = threading.Thread(target=stt_worker, name="stt-worker", daemon=True)
     worker.start()
@@ -264,21 +264,17 @@ async def ws_translate(ws: WebSocket):
                 msg = await stt_out.get()
                 t = msg.get("type")
 
-                # --- clean shutdown ---
                 if t == "__stt_done__":
                     break
 
-                # --- rollover between Google 5-min windows ---
                 if t == "__stt_rollover__":
                     if pending_interim and pending_interim.strip():
                         seq += 1
                         src_text = pending_interim.strip()
 
-                        # final_kr
                         await ws.send_json({"type": "final_kr", "text": src_text, "seq": seq})
                         await broadcast({"type": "final_kr", "text": src_text, "seq": seq})
 
-                        # translate (hybrid) + broadcast both shapes
                         hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
                         dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
 
@@ -294,7 +290,6 @@ async def ws_translate(ws: WebSocket):
                     pending_interim = None
                     continue
 
-                # --- normal interim / final from Google ---
                 if t == "interim":
                     pending_interim = msg.get("text", "")
                     payload = {"type": "interim_kr", "text": pending_interim}
@@ -348,6 +343,7 @@ async def ws_translate(ws: WebSocket):
                 logger.exception("STT supervisor error: %s", e)
         finally:
             logger.info("STT supervisor finished")
+
 
     feeder_task = asyncio.create_task(feeder())
     consumer_task = asyncio.create_task(stt_consumer())
