@@ -1,9 +1,9 @@
 # backend/app/services/google_services.py
 from __future__ import annotations
 
-import os, logging
+import os, logging, time
 from pathlib import Path
-from typing import Iterable, Generator, Optional
+from typing import Iterable, Generator, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from google.cloud import speech_v2, translate_v3, texttospeech
@@ -28,6 +28,10 @@ _glossary_warned: bool = False
 _translate_client: Optional[translate_v3.TranslationServiceClient] = None
 _tts_client: Optional[texttospeech.TextToSpeechClient] = None
 _speech_client: Optional[speech_v2.SpeechClient] = None
+
+# Public signals your WS consumer will handle:
+ROLL_SIGNAL: Dict[str, str] = {"type": "__stt_rollover__"}
+DONE_SIGNAL: Dict[str, str] = {"type": "__stt_done__"}
 
 
 # Old: hard-stop if env var missing
@@ -285,25 +289,94 @@ def stt_streaming_request_generator(
 def stt_streaming_transcripts(
     pcm16_chunks: Iterable[bytes],
     recognizer_id: Optional[str] = None,
-    src_lang: str = "ko-KR",               # <-- NEW
+    src_lang: str = "ko-KR",
+    window_seconds: int = 270,          # ~4m30s to stay under the 5-min hard cap
 ) -> Iterable[dict]:
+    """
+    Endless streaming recognizer that auto-rotates every `window_seconds`.
+    Yields:
+      - {"type": "interim", "text": str}
+      - {"type": "final",  "text": str}
+      - ROLL_SIGNAL between windows
+      - DONE_SIGNAL when upstream ends
+    """
     global _speech_client
     if _speech_client is None:
         _speech_client = speech_v2.SpeechClient()
 
-    responses = _speech_client.streaming_recognize(
-        requests=stt_streaming_request_generator(pcm16_chunks, recognizer_id, src_lang=src_lang)
+    recognizer = (
+        _recognizer_path() if recognizer_id is None
+        else f"{_speech_parent_global()}/recognizers/{recognizer_id}"
     )
-    for resp in responses:
-        for result in resp.results:
-            if not result.alternatives:
+
+    def _one_window_requests():
+        """Generator for one streaming window: first config, then audio frames until time limit."""
+        start_ts = time.time()
+
+        streaming_config = speech_v2.StreamingRecognitionConfig(
+            config=speech_v2.RecognitionConfig(
+                explicit_decoding_config=speech_v2.ExplicitDecodingConfig(
+                    encoding=speech_v2.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=16000,
+                    audio_channel_count=1,
+                ),
+                language_codes=[src_lang],
+                model="latest_long",
+                features=speech_v2.RecognitionFeatures(enable_automatic_punctuation=True),
+            ),
+            streaming_features=speech_v2.StreamingRecognitionFeatures(interim_results=True),
+        )
+
+        # First message: config
+        yield speech_v2.StreamingRecognizeRequest(
+            recognizer=recognizer, streaming_config=streaming_config
+        )
+
+        # Then the audio stream (stop at window_seconds)
+        for chunk in pcm16_chunks:
+            if not chunk:
                 continue
-            alt = result.alternatives[0]
-            yield {
-                "type": "final" if result.is_final else "interim",
-                "text": alt.transcript,
-                "stability": getattr(result, "stability", 0.0),
-            }
+            yield speech_v2.StreamingRecognizeRequest(recognizer=recognizer, audio=chunk)
+            if time.time() - start_ts >= window_seconds:
+                return  # end this window; outer loop will start a fresh one
+
+    try:
+        while True:
+            try:
+                responses = _speech_client.streaming_recognize(requests=_one_window_requests())
+                for resp in responses:
+                    for result in resp.results:
+                        if not result.alternatives:
+                            continue
+                        alt = result.alternatives[0]
+                        txt = (alt.transcript or "").strip()
+                        if not txt:
+                            continue
+                        yield {
+                            "type": "final" if result.is_final else "interim",
+                            "text": txt,
+                            "stability": getattr(result, "stability", 0.0),
+                        }
+
+                # Normal proactive rollover between windows
+                yield ROLL_SIGNAL
+
+            except Aborted as e:
+                # Google ends a stream with Aborted: 409 after ~5 minutes
+                if "Max duration of 5 minutes" in str(e) or "409" in str(e):
+                    yield ROLL_SIGNAL
+                else:
+                    logging.exception("STT Aborted: %s", e)
+                    time.sleep(0.5)
+            except Exception as e:
+                logging.exception("STT window error: %s", e)
+                time.sleep(0.5)
+
+            # Loop immediately to start a fresh window and keep consuming pcm16_chunks
+
+    finally:
+        # Upstream ended; let consumer exit cleanly
+        yield DONE_SIGNAL
 
 # =========================
 # Debug helpers

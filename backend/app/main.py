@@ -238,12 +238,10 @@ async def ws_translate(ws: WebSocket):
 
     def stt_worker():
         try:
-            # If your stt_streaming_transcripts supports language override,
-            # pass it in; else remove language_code=src_stt.
             for msg in stt_streaming_transcripts(
                 pcm_iter_sync(),
-                # recognizer_id="worship-global",
-                # language_code=src_stt,  # uncomment if your function supports it
+                src_lang=src_stt,          # <-- use the caller's language (e.g., "ko-KR")
+                # window_seconds=270,       # optional override
             ):
                 asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
         except Exception as e:
@@ -255,30 +253,63 @@ async def ws_translate(ws: WebSocket):
     worker.start()
 
     async def stt_consumer():
-        nonlocal seq  # <-- ADD THIS LINE
+        nonlocal seq
         logger.info("STT supervisor started")
+
+        pending_interim: Optional[str] = None
+
         try:
             src_tr = (src_stt.split("-")[0] or "ko").lower()
             while True:
                 msg = await stt_out.get()
-                if msg.get("type") == "__stt_done__":
+                t = msg.get("type")
+
+                # --- clean shutdown ---
+                if t == "__stt_done__":
                     break
 
-                if msg["type"] == "interim":
-                    # optional: preview the upcoming seq
-                    # preview_seq = seq + 1
-                    payload = {"type": "interim_kr", "text": msg["text"]}
+                # --- rollover between Google 5-min windows ---
+                if t == "__stt_rollover__":
+                    if pending_interim and pending_interim.strip():
+                        seq += 1
+                        src_text = pending_interim.strip()
+
+                        # final_kr
+                        await ws.send_json({"type": "final_kr", "text": src_text, "seq": seq})
+                        await broadcast({"type": "final_kr", "text": src_text, "seq": seq})
+
+                        # translate (hybrid) + broadcast both shapes
+                        hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
+                        dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
+
+                        fast = {"type":"fast_final","en":dst_text,"from":"google","dst":dst_tr,
+                                "origin":origin,"score":score,"seq":seq}
+                        live = {"mode":"live","text":dst_text,"seq":seq,
+                                "src":{"text":src_text,"lang":src_tr},
+                                "tgt":{"lang":dst_tr},"origin":origin,"score":score}
+                        await ws.send_json(fast)
+                        await broadcast(fast)
+                        await broadcast(live)
+
+                    pending_interim = None
+                    continue
+
+                # --- normal interim / final from Google ---
+                if t == "interim":
+                    pending_interim = msg.get("text", "")
+                    payload = {"type": "interim_kr", "text": pending_interim}
                     await ws.send_json(payload)
                     await broadcast(payload)
                     continue
 
-                # final → commit
+                # t == "final"
                 src_text = (msg.get("text") or "").strip()
                 if not src_text:
                     continue
 
-                seq += 1                # advance ON COMMIT
-                curr = seq              # freeze this value for this sentence
+                seq += 1
+                curr = seq
+                pending_interim = None
 
                 payload_final = {"type": "final_kr", "text": src_text, "seq": curr}
                 await ws.send_json(payload_final)
@@ -294,14 +325,14 @@ async def ws_translate(ws: WebSocket):
                     "dst": dst_tr,
                     "origin": origin,
                     "score": score,
-                    "seq": curr,         # same seq as final_kr
+                    "seq": curr,
                 }
                 await ws.send_json(payload_fast)
                 await broadcast(payload_fast)
-                
+
                 live_msg_new = {
                     "mode": "live",
-                    "text": dst_text,                 # what your viewer hook reads
+                    "text": dst_text,
                     "seq": curr,
                     "src": {"text": src_text, "lang": src_tr},
                     "tgt": {"lang": dst_tr},
