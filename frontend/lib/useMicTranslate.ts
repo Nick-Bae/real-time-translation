@@ -1,8 +1,3 @@
-export type WsMsg =
-  | { type: 'interim_kr'; text: string }
-  | { type: 'final_kr';  text: string }
-  | { type: 'fast_final'; en: string; from: 'google' };
-
 export type MicCtl = { start: () => Promise<void>; stop: () => Promise<void> };
 
 type ReconnectOpts = {
@@ -10,6 +5,62 @@ type ReconnectOpts = {
   maxDelayMs?: number;   // cap delay
   maxRetries?: number;   // 0 = infinite
 };
+
+// --- add near the top of useMicTranslate.ts where your types live ---
+
+// lib/useMicTranslate.ts
+
+export type InterimKrMsg = { type: "interim_kr"; text: string };
+export type FinalKrMsg   = { type: "final_kr";  text: string; seq?: number };
+export type FastFinalMsg = {
+  type: "fast_final";
+  en: string;
+  from: "google";
+  dst?: string;
+  origin?: string;
+  score?: number;
+  seq?: number;
+};
+
+// NEW message kinds
+export type CommitMsg = {
+  type: "commit";
+  payload: string;   // KO clause text
+  src?: string;      // e.g., "ko"
+  dst?: string;      // e.g., "en"
+};
+
+export type ServerTranslationMsg = {
+  type: "translation";
+  lang?: string;     // e.g., "en"
+  payload: string;   // translated text
+  meta?: Record<string, unknown>;
+};
+
+// Final union (replace your existing one with this)
+export type WsMsg =
+  | InterimKrMsg
+  | FinalKrMsg
+  | FastFinalMsg
+  | CommitMsg
+  | ServerTranslationMsg;
+
+
+function throttle(fn: (...args: any[]) => void, ms: number) {
+  let last = 0;
+  let timer: any = null;
+  return (...args: any[]) => {
+    const now = Date.now();
+    const remain = ms - (now - last);
+    if (remain <= 0) {
+      last = now;
+      fn(...args);
+    } else {
+      clearTimeout(timer);
+      timer = setTimeout(() => { last = Date.now(); fn(...args); }, remain);
+    }
+  };
+}
 
 export function startMicStream(
   wsUrl: string,
@@ -64,7 +115,7 @@ export function startMicStream(
       // normalize to ArrayBuffer (handles ArrayBuffer or TypedArray)
       const buf: ArrayBuffer =
         m instanceof ArrayBuffer ? m :
-        (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
+          (ArrayBuffer.isView(m) ? (m as ArrayBufferView).buffer : null as any);
 
       if (!buf) {
         console.warn('Worklet posted unknown payload:', m);
@@ -158,12 +209,14 @@ export function startMicStream(
 
     s.onmessage = (ev) => {
       try {
-        const m = JSON.parse(typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data));
+        const raw = typeof ev.data === 'string' ? ev.data : new TextDecoder().decode(ev.data);
+        const m = JSON.parse(raw) as WsMsg;  // <-- union now includes commit/translation
         onMsg(m);
       } catch {
         /* ignore non-JSON */
       }
     };
+
 
     s.onclose = (e) => {
       console.warn('WS closed', e.code, e.reason);
@@ -198,7 +251,7 @@ export function startMicStream(
 
       const s = ws;
       if (s && (s.readyState === WebSocket.OPEN || s.readyState === WebSocket.CONNECTING)) {
-        try { s.close(); } catch {}
+        try { s.close(); } catch { }
       }
       ws = null;
 

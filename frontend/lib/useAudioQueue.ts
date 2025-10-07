@@ -42,7 +42,7 @@ export function useAudioQueue(audioRef: MutableRefObject<HTMLAudioElement | null
         el.currentTime = 0;
         el.removeAttribute("src");
         el.load();
-      } catch {}
+      } catch { }
       if (revokeUrlRef.current) {
         URL.revokeObjectURL(revokeUrlRef.current);
         revokeUrlRef.current = null;
@@ -61,42 +61,71 @@ export function useAudioQueue(audioRef: MutableRefObject<HTMLAudioElement | null
   }, [queue]);
 
   const start = useCallback(async (item: QueueItem) => {
-    const el = audioRef.current;
-    if (!el) return;
+  const el = audioRef.current;
+  if (!el) return;
 
-    if (revokeUrlRef.current) {
-      URL.revokeObjectURL(revokeUrlRef.current);
-      revokeUrlRef.current = null;
-    }
+  // Revoke previous object URL if any
+  if (revokeUrlRef.current) {
+    URL.revokeObjectURL(revokeUrlRef.current);
+    revokeUrlRef.current = null;
+  }
 
-    if (item.url) {
-      el.src = item.url;
-    } else if (item.blob) {
-      const u = URL.createObjectURL(item.blob);
-      revokeUrlRef.current = u;
-      el.src = u;
-    } else if (item.arrayBuffer) {
-      const blob = new Blob([item.arrayBuffer], { type: "audio/mpeg" });
-      const u = URL.createObjectURL(blob);
-      revokeUrlRef.current = u;
-      el.src = u;
-    } else {
-      // no audio data
-      setQueue((prev) => prev.slice(1));
-      return;
-    }
+  // Hard reset BEFORE swapping source
+  try {
+    el.pause();
+    el.currentTime = 0;
+    el.removeAttribute("src");
+    el.load();
+  } catch {}
 
-    try {
-      playingRef.current = true;
-      await el.play();
-    } catch (err) {
-      // autoplay blocked or other error: skip this item
-      playingRef.current = false;
-      setQueue((prev) => prev.slice(1));
-      // optional: surface the error to UI if you want
-      // console.warn("Audio play failed:", err);
-    }
-  }, [audioRef]);
+  // Build a URL for the item
+  let url: string | null = null;
+  if (item.url) {
+    url = item.url;
+  } else if (item.blob) {
+    if (!item.blob.size) { setQueue((p) => p.slice(1)); return; }
+    url = URL.createObjectURL(item.blob);
+    revokeUrlRef.current = url;
+  } else if (item.arrayBuffer) {
+    if (!item.arrayBuffer.byteLength) { setQueue((p) => p.slice(1)); return; }
+    const blob = new Blob([item.arrayBuffer], { type: "audio/mpeg" });
+    url = URL.createObjectURL(blob);
+    revokeUrlRef.current = url;
+  } else {
+    setQueue((p) => p.slice(1));
+    return;
+  }
+
+  // Assign src, then explicitly load, then wait metadata
+  el.src = url;
+  el.load();
+
+  const ok = await new Promise<boolean>((resolve) => {
+    const onLoaded = () => { cleanup(); resolve(true); };
+    const onErr = () => { cleanup(); resolve(false); };
+    const cleanup = () => {
+      el.removeEventListener("loadedmetadata", onLoaded);
+      el.removeEventListener("error", onErr);
+    };
+    el.addEventListener("loadedmetadata", onLoaded, { once: true });
+    el.addEventListener("error", onErr, { once: true });
+  });
+
+  if (!ok) {
+    // Drop this item and continue
+    setQueue((p) => p.slice(1));
+    return;
+  }
+
+  try {
+    playingRef.current = true;
+    el.currentTime = 0; // always start at 0 to avoid stale seeks
+    await el.play();
+  } catch {
+    playingRef.current = false;
+    setQueue((p) => p.slice(1));
+  }
+}, [audioRef]);
 
   const enqueue = useCallback((item: QueueItem) => {
     setQueue((prev) => {
@@ -116,7 +145,7 @@ export function useAudioQueue(audioRef: MutableRefObject<HTMLAudioElement | null
         el.currentTime = 0;
         el.removeAttribute("src");
         el.load();
-      } catch {}
+      } catch { }
     }
     if (revokeUrlRef.current) {
       URL.revokeObjectURL(revokeUrlRef.current);

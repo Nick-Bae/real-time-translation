@@ -13,7 +13,7 @@ type FastFinalMsg = {
   dst?: string;
   origin?: string;
   score?: number;
-  seq?: number;   // ← optional
+  seq?: number; // optional
 };
 
 const LANGS: Lang[] = [
@@ -32,9 +32,8 @@ const VOICE_BY_TR: Record<string, string> = {
   zh: "cmn-CN-Wavenet-A",
 };
 
-// Backing REST + WS bases from your env (unchanged)
 const API = process.env.NEXT_PUBLIC_API_BASE_URL!;
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL!; // should already be .../ws/translate
+const WS_BASE = process.env.NEXT_PUBLIC_WS_URL!;
 
 export default function Live() {
   // UI state
@@ -45,44 +44,73 @@ export default function Live() {
   const [krInterim, setKrInterim] = useState("");
   const [krFinal, setKrFinal] = useState("");
   const [en, setEn] = useState("");
-  const [status, setStatus] = useState<"idle" | "running" | "stopped" | "error">("idle");
+  const [status, setStatus] =
+    useState<"idle" | "running" | "stopped" | "error">("idle");
   const [errMsg, setErrMsg] = useState<string>("");
   const [micRms, setMicRms] = useState<number>(0);
+
+  // (optional) show clause splits explicitly
+  const [segments, setSegments] = useState<string[]>([]);
 
   const audioRef = useRef<HTMLAudioElement>(null);
   const ctlRef = useRef<ReturnType<typeof startMicStream> | null>(null);
   const { enqueue, clear } = useAudioQueue(audioRef);
-  const seqRef = useRef<number>(1); // local sequence to preserve order
+  const seqRef = useRef<number>(1);
+  const lastCommitAtRef = useRef<number>(0);
+
+  const COMMIT_GRACE_MS = 3000; // use this consistent window
+  const recentKoCommitsRef = useRef<Map<string, number>>(new Map());
+  const recentEnPlayedRef = useRef<Map<string, number>>(new Map());
+
+  const DEDUP_WINDOW_MS = 4000; // ignore exact duplicates within 4s
+
+  function normKo(s: string) {
+    return (s || "").replace(/\s+/g, " ").trim();
+  }
+  function normEn(s: string) {
+    return (s || "").replace(/\s+/g, " ").trim();
+  }
+  function seenRecently(map: Map<string, number>, key: string, windowMs: number) {
+    const now = Date.now();
+    // prune old entries (keep map small)
+    for (const [k, t] of map) if (now - t > windowMs) map.delete(k);
+    const hit = map.has(key) && (now - (map.get(key) || 0)) < windowMs;
+    if (!hit) map.set(key, now);
+    return hit;
+  }
+
 
   function errorMessage(err: unknown): string {
     if (err instanceof Error) return err.message;
-    if (typeof err === 'string') return err;
+    if (typeof err === "string") return err;
     try {
       return JSON.stringify(err);
     } catch {
-      return 'Unknown error';
+      return "Unknown error";
     }
   }
 
-  // Build a WS URL with role + chosen languages + voice
   function buildWsUrl() {
     const src = LANGS[srcIdx];
     const dst = LANGS[dstIdx];
     const voice = VOICE_BY_TR[dst.tr] || "en-US-Wavenet-D";
 
     const u = new URL(WS_BASE);
-    // IMPORTANT: backend expects role
     u.searchParams.set("role", "producer");
-    u.searchParams.set("src", src.stt);    // STT language, e.g. "en-US"
-    u.searchParams.set("dst", dst.tr);     // Translate target, e.g. "ko"
+    u.searchParams.set("src", src.stt);
+    u.searchParams.set("dst", dst.tr);
     u.searchParams.set("voice", voice);
     return u.toString();
   }
 
   async function onStart() {
     try {
-      setErrMsg('');
-      setStatus('running');
+      setErrMsg("");
+      setStatus("running");
+      setSegments([]);
+      setEn("");
+      setKrInterim("");
+      setKrFinal("");
 
       await ctlRef.current?.stop?.().catch(() => { });
       ctlRef.current = null;
@@ -91,11 +119,16 @@ export default function Live() {
 
       const ctl = startMicStream(
         wsUrl,
-        async (m) => {
-          if (m.type === 'interim_kr') setKrInterim(m.text);
-          if (m.type === 'final_kr') setKrFinal(m.text);
+        async (m: any) => {
+          console.log("[WS IN]", m.type, m);
+          if (m.type === "interim_kr") setKrInterim(m.text);
+          if (m.type === "final_kr") setKrFinal(m.text);
+
+          // Prevent fast_final from stomping on a fresh commit
           if (m.type === "fast_final") {
-            const ff = m as FastFinalMsg; // narrow
+            if (Date.now() - lastCommitAtRef.current < COMMIT_GRACE_MS) return;
+
+            const ff = m as FastFinalMsg;
             setEn(ff.en);
 
             try {
@@ -108,10 +141,114 @@ export default function Live() {
                 }),
               });
               if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
-              const blob = await res.blob();
 
+              const ab = await res.arrayBuffer();
+              if (ab.byteLength === 0) {
+                console.warn("TTS returned empty audio; skipping");
+                return;
+              }
               const backendSeq = typeof ff.seq === "number" ? ff.seq : undefined;
-              enqueue({ blob, seq: backendSeq });
+              enqueue({ arrayBuffer: ab, seq: backendSeq }); // ✅ your queue understands this
+            } catch (err) {
+              console.error(err);
+            }
+          }
+
+          // Server-driven clause commit → client translate + TTS
+          if (m.type === "commit") {
+            try {
+              console.log("[COMMIT] raw:", m);
+
+              lastCommitAtRef.current = Date.now();
+
+              // 1) de-dupe same KO within a short window
+              const koClauseRaw = typeof m.payload === "string" ? m.payload : "";
+              const koClause = normKo(koClauseRaw);
+              if (!koClause) return;
+
+              if (seenRecently(recentKoCommitsRef.current, koClause, DEDUP_WINDOW_MS)) {
+                console.log("[COMMIT] dedup KO (skip)", koClause);
+                return;
+              }
+
+              const srcCode = LANGS[srcIdx].tr; // "ko"
+              const dstCode = LANGS[dstIdx].tr; // "en"
+
+              // 2) translate
+              const trRes = await fetch(`${API}/api/translate`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: koClause, src: srcCode, dst: dstCode }),
+              });
+              if (!trRes.ok) {
+                const eTxt = await trRes.text().catch(() => "");
+                console.error("[COMMIT] translate failed:", trRes.status, eTxt);
+                return;
+              }
+              const trJson = await trRes.json().catch(() => ({} as any));
+              const enText =
+                (typeof trJson?.text === "string" && trJson.text) ||
+                (typeof trJson?.translated === "string" && trJson.translated) ||
+                (typeof trJson?.en === "string" && trJson.en) ||
+                "";
+
+              const enNorm = normEn(enText);
+              if (!enNorm) {
+                console.warn("[COMMIT] empty EN");
+                return;
+              }
+
+              // 3) de-dupe same EN playback
+              if (seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
+                console.log("[COMMIT] dedup EN (skip TTS)", enNorm);
+              } else {
+                // TTS
+                const ttsRes = await fetch(`${API}/api/tts`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    text: enNorm,
+                    voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+                  }),
+                });
+                if (ttsRes.ok) {
+                  const ab = await ttsRes.arrayBuffer();
+                  if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
+                } else {
+                  console.warn("[COMMIT] TTS failed", ttsRes.status);
+                }
+              }
+
+              // 4) UI: only push if last segment differs (avoid visible repeats)
+              setEn(enNorm);
+              setSegments((prev) => {
+                if (prev.length && normEn(prev[prev.length - 1]) === enNorm) return prev;
+                return [...prev, enNorm];
+              });
+            } catch (e) {
+              console.error("[COMMIT] error:", e);
+            }
+          }
+
+          // Optional: if backend sends already-translated chunks
+          if (m.type === "translation") {
+            const enText = String(m.payload || "");
+            setEn(enText);
+            setSegments((prev) => [...prev, enText]);
+            try {
+              const res = await fetch(`${API}/api/tts`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  text: enText,
+                  voice:
+                    VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+                }),
+              });
+              if (!res.ok)
+                throw new Error(`TTS ${res.status} ${res.statusText}`);
+              const blob = await res.blob();
+              enqueue({ blob });
             } catch (err) {
               console.error(err);
             }
@@ -123,8 +260,8 @@ export default function Live() {
       ctlRef.current = ctl;
       await ctl.start();
     } catch (err: unknown) {
-      setStatus('error');
-      setErrMsg(errorMessage(err)); // ✅ properly narrowed
+      setStatus("error");
+      setErrMsg(errorMessage(err));
       console.error(err);
     }
   }
@@ -155,7 +292,9 @@ export default function Live() {
               onChange={(e) => setSrcIdx(Number(e.target.value))}
             >
               {LANGS.map((l, i) => (
-                <option value={i} key={l.stt}>{l.label} – {l.stt}</option>
+                <option value={i} key={l.stt}>
+                  {l.label} – {l.stt}
+                </option>
               ))}
             </select>
 
@@ -166,7 +305,9 @@ export default function Live() {
               onChange={(e) => setDstIdx(Number(e.target.value))}
             >
               {LANGS.map((l, i) => (
-                <option value={i} key={l.tr}>{l.label} – {l.tr}</option>
+                <option value={i} key={l.tr}>
+                  {l.label} – {l.tr}
+                </option>
               ))}
             </select>
 
@@ -184,9 +325,11 @@ export default function Live() {
               >
                 Stop
               </button>
-              {/* Optional: emergency flush button */}
               <button
-                onClick={() => clear()}
+                onClick={() => {
+                  clear();
+                  setSegments([]);
+                }}
                 className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
               >
                 Flush Queue
@@ -243,11 +386,25 @@ export default function Live() {
           <div className="space-y-6">
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
               <div className="mb-2 text-xs font-medium uppercase tracking-wide text-gray-500">
-                Target (fast final)
+                Target (clause / fast final)
               </div>
               <div className="min-h-24 whitespace-pre-wrap text-lg font-semibold text-gray-900">
                 {en || <span className="text-gray-400">—</span>}
               </div>
+
+              {/* Optional: render clause segments so you can *see* the split */}
+              {segments.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {segments.map((s, i) => (
+                    <div
+                      key={i}
+                      className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-800"
+                    >
+                      {s}
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
 
             <section className="rounded-2xl border border-gray-200 bg-white p-5 shadow-sm">
