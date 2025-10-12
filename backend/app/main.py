@@ -529,7 +529,7 @@ async def ws_translate(ws: WebSocket):
                         remainder = ""
 
                     if remainder and len(remainder) >= MIN_COMMIT_CHARS and _tok_count(remainder) >= MIN_COMMIT_TOKENS:
-                        sent = await _send_commit_once(remainder)
+                        sent = await _send_commit_now(remainder)
                         if sent:
                             commit_used = True
 
