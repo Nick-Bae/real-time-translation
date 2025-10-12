@@ -30,8 +30,8 @@ const HOLD_ENDINGS =
 const ADVERB_TAIL =
   /(정말|진짜|아주|매우|너무|대단히|굉장히|열심히|잘|많이|조금|약간)$/;
 
-// if ending directly on these particles, be suspicious (hold a bit longer)
-const PARTICLE_TAIL = /(은|는|이|가|을|를|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|같이)$/
+  const PARTICLE_TAIL = /(은|는|이|가|을|를|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|같이)$/
+  // if ending directly on these particles, be suspicious (hold a bit longer)
 
 function normalizeWS(s: string) {
   return s.replace(/\s+/g, ' ').trim();

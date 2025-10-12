@@ -61,6 +61,13 @@ export default function Live() {
   const COMMIT_GRACE_MS = 3000; // use this consistent window
   const recentKoCommitsRef = useRef<Map<string, number>>(new Map());
   const recentEnPlayedRef = useRef<Map<string, number>>(new Map());
+  // Keep one EN per KO clause (within a short window)
+  const enByKoRef = useRef<Map<string, { en: string; spoken: boolean; ts: number }>>(new Map());
+  const lastKoKeyRef = useRef<string | null>(null);
+  const spokenSeqsRef = useRef<Set<number>>(new Set());
+
+  const KO_WINDOW_MS = 5000; // treat EN updates for the same KO within 5s as the same clause
+
 
   const DEDUP_WINDOW_MS = 4000; // ignore exact duplicates within 4s
 
@@ -77,6 +84,18 @@ export default function Live() {
     const hit = map.has(key) && (now - (map.get(key) || 0)) < windowMs;
     if (!hit) map.set(key, now);
     return hit;
+  }
+  function koKey(s: string) {
+    // collapses whitespace → stable key for a KO clause
+    return (s || "").replace(/\s+/g, " ").trim();
+  }
+
+  function purgeOldKo(
+    map: Map<string, { en: string; spoken: boolean; ts: number }>,
+    windowMs = KO_WINDOW_MS
+  ) {
+    const now = Date.now();
+    for (const [k, v] of map) if (now - v.ts > windowMs) map.delete(k);
   }
 
 
@@ -126,29 +145,68 @@ export default function Live() {
 
           // Prevent fast_final from stomping on a fresh commit
           if (m.type === "fast_final") {
-            if (Date.now() - lastCommitAtRef.current < COMMIT_GRACE_MS) return;
-
             const ff = m as FastFinalMsg;
-            setEn(ff.en);
 
+            // normalize
+            const en = (ff.en || "").replace(/\s+/g, " ").trim();
+            if (!en) return;
+
+            const seq = typeof ff.seq === "number" ? ff.seq : undefined;
+            const now = Date.now();
+
+            // Always update UI (treat as preview/refinement in the last line)
+            setEn(en);
+            setSegments(prev => {
+              if (!prev.length) return [en];
+              const copy = prev.slice();
+              copy[copy.length - 1] = en;
+              return copy;
+            });
+
+            // If we already spoke this seq, bail
+            if (seq && spokenSeqsRef.current.has(seq)) return;
+
+            // Keep KO->EN cache small and current
+            if (lastKoKeyRef.current) {
+              for (const [k, v] of enByKoRef.current) {
+                if (now - v.ts > KO_WINDOW_MS) enByKoRef.current.delete(k);
+              }
+              const prev = enByKoRef.current.get(lastKoKeyRef.current);
+              enByKoRef.current.set(lastKoKeyRef.current, {
+                en,
+                spoken: prev?.spoken ?? false,
+                ts: now,
+              });
+            }
+
+            // If a commit was just sent, treat fast_final as preview only (no TTS).
+            // This avoids a double play when the commit TTS lands a moment later.
+            if (now - lastCommitAtRef.current < COMMIT_GRACE_MS && lastKoKeyRef.current) {
+              return;
+            }
+
+            // Otherwise, speak the fast_final (this is the "no early commit" case).
             try {
               const res = await fetch(`${API}/api/tts`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  text: ff.en,
+                  text: en,
                   voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
                 }),
               });
               if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
 
               const ab = await res.arrayBuffer();
-              if (ab.byteLength === 0) {
-                console.warn("TTS returned empty audio; skipping");
-                return;
+              if (ab.byteLength > 0) {
+                enqueue({ arrayBuffer: ab, seq });
+                if (seq) spokenSeqsRef.current.add(seq);
+
+                // Mark spoken for this KO key too (prevents re-speaking on a later commit of same clause)
+                if (lastKoKeyRef.current) {
+                  enByKoRef.current.set(lastKoKeyRef.current, { en, spoken: true, ts: now });
+                }
               }
-              const backendSeq = typeof ff.seq === "number" ? ff.seq : undefined;
-              enqueue({ arrayBuffer: ab, seq: backendSeq }); // ✅ your queue understands this
             } catch (err) {
               console.error(err);
             }
@@ -161,7 +219,7 @@ export default function Live() {
 
               lastCommitAtRef.current = Date.now();
 
-              // 1) de-dupe same KO within a short window
+              // 1) Normalize KO, compute stable KO key, remember it for fast_final merges
               const koClauseRaw = typeof m.payload === "string" ? m.payload : "";
               const koClause = normKo(koClauseRaw);
               if (!koClause) return;
@@ -171,10 +229,14 @@ export default function Live() {
                 return;
               }
 
+              const key = koKey(koClause);
+              lastKoKeyRef.current = key;
+              purgeOldKo(enByKoRef.current);
+
               const srcCode = LANGS[srcIdx].tr; // "ko"
               const dstCode = LANGS[dstIdx].tr; // "en"
 
-              // 2) translate
+              // 2) Translate
               const trRes = await fetch(`${API}/api/translate`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -191,18 +253,38 @@ export default function Live() {
                 (typeof trJson?.translated === "string" && trJson.translated) ||
                 (typeof trJson?.en === "string" && trJson.en) ||
                 "";
-
               const enNorm = normEn(enText);
               if (!enNorm) {
                 console.warn("[COMMIT] empty EN");
                 return;
               }
 
-              // 3) de-dupe same EN playback
-              if (seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
+              // 3) Coalesce by KO key: replace last UI line if we already showed a preview/older EN
+              const existing = enByKoRef.current.get(key);
+              setEn(enNorm);
+              setSegments((prev) => {
+                if (!prev.length) return [enNorm];
+                if (existing) {
+                  // last segment belongs to this KO (fast_final preview or earlier commit): replace it
+                  const copy = prev.slice();
+                  copy[copy.length - 1] = enNorm;
+                  return copy;
+                }
+                // if identical to last, keep list stable
+                if (normEn(prev[prev.length - 1]) === enNorm) return prev;
+                return [...prev, enNorm];
+              });
+
+              // 4) Speak once per KO key (commit path is authoritative)
+              let speak = !existing?.spoken;
+
+              // keep your “recent EN spoken” dedup as an extra guard
+              if (speak && seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
                 console.log("[COMMIT] dedup EN (skip TTS)", enNorm);
-              } else {
-                // TTS
+                speak = false;
+              }
+
+              if (speak) {
                 const ttsRes = await fetch(`${API}/api/tts`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -211,25 +293,27 @@ export default function Live() {
                     voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
                   }),
                 });
+
                 if (ttsRes.ok) {
                   const ab = await ttsRes.arrayBuffer();
-                  if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
+                  if (ab.byteLength > 0) {
+                    enqueue({ arrayBuffer: ab });
+                    enByKoRef.current.set(key, { en: enNorm, spoken: true, ts: Date.now() });
+                  } else {
+                    enByKoRef.current.set(key, { en: enNorm, spoken: false, ts: Date.now() });
+                  }
                 } else {
                   console.warn("[COMMIT] TTS failed", ttsRes.status);
+                  enByKoRef.current.set(key, { en: enNorm, spoken: false, ts: Date.now() });
                 }
+              } else {
+                // Already spoken (or dedupbed): just update cache with latest text/time
+                enByKoRef.current.set(key, { en: enNorm, spoken: true, ts: Date.now() });
               }
-
-              // 4) UI: only push if last segment differs (avoid visible repeats)
-              setEn(enNorm);
-              setSegments((prev) => {
-                if (prev.length && normEn(prev[prev.length - 1]) === enNorm) return prev;
-                return [...prev, enNorm];
-              });
             } catch (e) {
               console.error("[COMMIT] error:", e);
             }
           }
-
           // Optional: if backend sends already-translated chunks
           if (m.type === "translation") {
             const enText = String(m.payload || "");

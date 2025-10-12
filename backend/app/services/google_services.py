@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os, logging, time, grpc
 from pathlib import Path
-from typing import Iterable, Generator, Dict, Any, Optional
+from typing import Callable, Iterable, Iterator, Generator, Dict, Any, Optional
 
 from dotenv import load_dotenv
 from google.cloud import speech_v2, translate_v3, texttospeech
@@ -20,7 +20,7 @@ load_dotenv(dotenv_path=str(ENV_PATH), override=True)
 # ---- Constants (adjust if needed) ----
 LANG_CODE = "ko-KR"
 SAMPLE_RATE_HZ = 16000
-MODEL_ID = "latest_long"
+MODEL_ID = "latest_short"
 DEFAULT_RECOGNIZER_ID = "worship-global"   # your created global recognizer
 
 _glossary_warned: bool = False
@@ -273,7 +273,7 @@ def stt_streaming_request_generator(
                 audio_channel_count=1,
             ),
             language_codes=[src_lang],     # <-- use caller’s language
-            model="latest_long",
+            model="latest_short",
             features=speech_v2.RecognitionFeatures(enable_automatic_punctuation=True),
         ),
         streaming_features=speech_v2.StreamingRecognitionFeatures(interim_results=True),
@@ -287,19 +287,13 @@ def stt_streaming_request_generator(
 
 
 def stt_streaming_transcripts(
-    pcm16_chunks: Iterable[bytes],
+    pcm_source: Callable[[], Iterator[bytes]],
     recognizer_id: Optional[str] = None,
     src_lang: str = "ko-KR",
-    window_seconds: int = 270,          # ~4m30s to stay under Google's ~5m cap
-) -> Iterable[dict]:
-    """
-    Endless streaming recognizer that auto-rotates every `window_seconds`.
-    Yields:
-      - {"type": "interim", "text": str}
-      - {"type": "final",  "text": str}
-      - ROLL_SIGNAL between windows
-      - DONE_SIGNAL when upstream ends
-    """
+    window_seconds: int = 270,
+    enable_voice_activity_events: bool = True,
+    use_latest_long: bool = True,
+) -> Iterable[Dict[str, Any]]:
     global _speech_client
     if _speech_client is None:
         _speech_client = speech_v2.SpeechClient()
@@ -308,48 +302,61 @@ def stt_streaming_transcripts(
         _recognizer_path() if recognizer_id is None
         else f"{_speech_parent_global()}/recognizers/{recognizer_id}"
     )
+    model_name = "latest_long" if use_latest_long else "latest_short"
 
-    def _one_window_requests():
-        """One streaming window: first config, then audio frames until time limit."""
+    def _one_window_requests() -> Iterator[speech_v2.StreamingRecognizeRequest]:
         start_ts = time.time()
 
+        # ✅ VAE flag belongs here (StreamingRecognitionFeatures), not in RecognitionFeatures
         streaming_config = speech_v2.StreamingRecognitionConfig(
             config=speech_v2.RecognitionConfig(
                 explicit_decoding_config=speech_v2.ExplicitDecodingConfig(
                     encoding=speech_v2.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=16000,   # MUST match your input frames
+                    sample_rate_hertz=16000,
                     audio_channel_count=1,
                 ),
                 language_codes=[src_lang],
-                model="latest_long",
-                features=speech_v2.RecognitionFeatures(enable_automatic_punctuation=True),
+                model=model_name,
+                features=speech_v2.RecognitionFeatures(
+                    enable_automatic_punctuation=True,
+                ),
             ),
-            streaming_features=speech_v2.StreamingRecognitionFeatures(interim_results=True),
+            streaming_features=speech_v2.StreamingRecognitionFeatures(
+                interim_results=True,
+                enable_voice_activity_events=enable_voice_activity_events,  # ← moved here
+            ),
         )
 
-        # First message: config
+        # fresh iterator per window (prevents “generator already executing”)
+        pcm_iter = pcm_source()
+
+        # first: config
         yield speech_v2.StreamingRecognizeRequest(
             recognizer=recognizer, streaming_config=streaming_config
         )
 
-        # Then audio frames until the window time elapses
-        for chunk in pcm16_chunks:
+        # then: audio
+        for chunk in pcm_iter:
             if not chunk:
                 continue
-            yield speech_v2.StreamingRecognizeRequest(recognizer=recognizer, audio=chunk)
+            yield speech_v2.StreamingRecognizeRequest(
+                recognizer=recognizer,
+                audio=chunk,
+            )
             if time.time() - start_ts >= window_seconds:
-                return  # end this window; outer loop will roll over
+                return  # roll window
 
     try:
         while True:
             try:
-                responses = _speech_client.streaming_recognize(requests=_one_window_requests())
+                responses = _speech_client.streaming_recognize(
+                    requests=_one_window_requests()
+                )
 
-                # Pull first response eagerly to surface startup RPC errors with details
+                # pull first to surface RPC setup errors
                 try:
                     first = next(responses)
                 except StopIteration:
-                    # No results this window (silence etc.) -> still roll over
                     yield ROLL_SIGNAL
                     continue
                 except grpc.RpcError as e:
@@ -357,21 +364,27 @@ def stt_streaming_transcripts(
                     details = getattr(e, "details", lambda: "")()
                     logging.error("STT RPC error (on first): code=%s details=%r",
                                   getattr(code, "name", code), details)
-                    # Treat ABORTED/5-min as a rollover; others propagate/backoff
                     if (getattr(code, "name", None) == "ABORTED"
                         or "Max duration of 5 minutes" in str(details)):
                         yield ROLL_SIGNAL
                         continue
                     raise
 
-                # Iterate the first + the rest
                 def _iter_all():
                     yield first
                     for r in responses:
                         yield r
 
                 for resp in _iter_all():
-                    for result in resp.results:
+                    # VAE → end of speech
+                    try:
+                        SpeechEventType = speech_v2.StreamingRecognizeResponse.SpeechEventType
+                        if resp.speech_event_type == SpeechEventType.SPEECH_ACTIVITY_END:
+                            yield {"type": "__speech_activity_end__"}
+                    except Exception:
+                        pass
+
+                    for result in getattr(resp, "results", []):
                         if not result.alternatives:
                             continue
                         alt = result.alternatives[0]
@@ -384,11 +397,9 @@ def stt_streaming_transcripts(
                             "stability": getattr(result, "stability", 0.0),
                         }
 
-                # Normal proactive rollover between windows
                 yield ROLL_SIGNAL
 
             except Aborted as e:
-                # Google ends a stream with Aborted: 409 after ~5 minutes
                 if "Max duration of 5 minutes" in str(e) or "409" in str(e):
                     yield ROLL_SIGNAL
                 else:
@@ -400,15 +411,12 @@ def stt_streaming_transcripts(
                 details = getattr(e, "details", lambda: "")()
                 name = getattr(code, "name", code)
                 logging.error("STT RPC error: code=%s details=%r", name, details)
-
-                # Explicit handling so you see the real cause in logs
                 if name == "ABORTED" or "Max duration of 5 minutes" in str(details):
                     yield ROLL_SIGNAL
-                elif name in ("UNAUTHENTICATED", "PERMISSION_DENIED", "INVALID_ARGUMENT", "NOT_FOUND"):
-                    # Fatal config/auth problems: surface so you fix IAM, recognizer, sample rate, etc.
+                elif name in ("UNAUTHENTICATED","PERMISSION_DENIED","INVALID_ARGUMENT","NOT_FOUND"):
                     raise
                 elif name in ("RESOURCE_EXHAUSTED",):
-                    time.sleep(1.0)  # brief backoff then continue
+                    time.sleep(1.0)
                 else:
                     time.sleep(0.5)
 
@@ -416,10 +424,7 @@ def stt_streaming_transcripts(
                 logging.exception("STT window error: %s", e)
                 time.sleep(0.5)
 
-            # Loop: start a fresh window and continue consuming pcm16_chunks
-
     finally:
-        # Upstream ended; let consumer exit cleanly
         yield DONE_SIGNAL
 
 

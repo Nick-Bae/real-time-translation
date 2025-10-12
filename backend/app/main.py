@@ -5,6 +5,7 @@ import json
 import asyncio
 import logging
 import pathlib
+import queue
 import threading, time
 from typing import Deque, Iterable, Optional
 from collections import deque
@@ -12,10 +13,10 @@ import google.auth
 from google.oauth2 import service_account
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File  # <-- FIXED
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request, HTTPException, Body, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from asyncio import CancelledError
 from typing import Set
 from starlette.websockets import WebSocketState
@@ -27,6 +28,7 @@ import re
 # Local modules
 from app.socket_manager import manager
 from app.deepgram_session import connect_to_deepgram
+from app.segmentation import ClauseCommitter, CommitConfig
 from app.utils.translate import translate_text
 from app.routes import translate as translate_routes
 from app.routes import hybrid as hybrid_routes
@@ -39,12 +41,20 @@ from app.services.google_services import (
     stt_streaming_transcripts,
     debug_log_speech_paths,
     ensure_global_recognizer,
-    # translate_text_generic
+    translate_text_generic
 )
 
 
 # ---- Optional: existing routers
 from app.routes import translate as translate_routes  # keeps your /api endpoints
+
+class TranslateReq(BaseModel):
+    text: str = Field(..., description="Text to translate")
+    src: str = Field(..., description="Source BCP-47 or ISO code, e.g. 'ko'")
+    dst: str = Field(..., description="Target code, e.g. 'en'")
+
+class TranslateRes(BaseModel):
+    text: str  # translated text
 
 # ------------------------------------------------------------------------------
 # Logging (configure once)
@@ -202,49 +212,81 @@ async def ws_translate(ws: WebSocket):
         return
 
     # ---------- Producer path (microphone sender) ----------
-    q: Deque[bytes] = deque()
-    cv = threading.Condition()
+    SENTINEL = object()
+    pcm_queue: "queue.Queue[bytes | object]" = queue.Queue(maxsize=64)  # small backpressure
     closed = False
 
     async def feeder():
         nonlocal closed
         try:
             async for data in ws.iter_bytes():
-                if data:
-                    with cv:
-                        q.append(data)
-                        cv.notify()
+                if not data:
+                    continue
+                try:
+                    pcm_queue.put_nowait(data)
+                except queue.Full:
+                    # drop oldest frame to keep real-time
+                    try:
+                        _ = pcm_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    pcm_queue.put_nowait(data)
         except (WebSocketDisconnect, CancelledError):
             pass
         finally:
-            with cv:
-                closed = True
-                cv.notify_all()
+            closed = True
+            try:
+                pcm_queue.put_nowait(SENTINEL)
+            except queue.Full:
+                pass
             logger.info("feeder finished")
 
     def pcm_iter_sync():
+        """Fresh, blocking iterator over queue; one instance per STT window."""
         while True:
-            with cv:
-                while not q and not closed:
-                    cv.wait(timeout=0.1)
-                if q:
-                    yield q.popleft()
-                elif closed:
+            try:
+                item = pcm_queue.get(timeout=0.2)
+            except queue.Empty:
+                if closed:
                     return
+                continue
+            if item is SENTINEL:
+                return
+            yield item  # bytes
+
 
     # thread → async queue
     loop = asyncio.get_running_loop()
     stt_out: asyncio.Queue[dict] = asyncio.Queue()
 
     def stt_worker():
+        min_delay = 0.5
+        max_delay = 8.0
+        attempts = 0
         try:
-            for msg in stt_streaming_transcripts(
-                pcm_iter_sync(),
-                src_lang=src_stt,   # <-- add this
-            ):
-                asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
+            while True:
+                if closed:
+                    break
+                try:
+                    # PASS A CALLABLE, NOT pcm_iter_sync()
+                    for msg in stt_streaming_transcripts(
+                        pcm_source=pcm_iter_sync,   # <-- ✅ factory
+                        src_lang=src_stt,
+                    ):
+                        asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
+                    break  # normal end
+                except Exception as e:
+                    emsg = str(e)
+                    logger.error("STT window error: %s", emsg)
+                    if closed:
+                        break
+                    attempts += 1
+                    delay = min(max_delay, min_delay * (2 ** (attempts - 1)))
+                    logger.warning("Restarting STT window in %.1fs (attempt %d)", delay, attempts)
+                    time.sleep(delay)
+                    continue
         except Exception as e:
-            logger.error("STT worker error: %s", e, exc_info=True)
+            logger.exception("STT worker fatal error: %s", e)
         finally:
             asyncio.run_coroutine_threadsafe(stt_out.put({"type": "__stt_done__"}), loop)
 
@@ -255,86 +297,274 @@ async def ws_translate(ws: WebSocket):
     async def stt_consumer():
         nonlocal seq
         logger.info("STT supervisor started")
+        last_utter_prefix: str = ""     # longest KO commit for current utterance
 
+
+        # --- per-utterance state ---
         pending_interim: Optional[str] = None
+        commit_used = False
+        sent_fast_final = False  # ensure at most one fast_final per utterance
+
+        # --- knobs (tune these) ---
+        COALESCE_MS = 180
+        MIN_COMMIT_TOKENS = 2
+        MIN_COMMIT_CHARS  = 10
+        DEDUP_WINDOW_S    = 4.0
+
+        # connective tails we should NOT emit alone
+        # Replace your old CONNECTIVE_TAIL with this:
+        # block ONLY if the text ends with an incomplete connective (no trailing content/punct)
+        CONNECTIVE_TAIL = re.compile(
+            r"(?:"
+            r"기\s*때(?:문|문에?)|"  # 기 때문에 / 기 때문…
+            r"때(?:문|문에?)|"       # 때문에 / 때문…
+            r"(?:으)?니|[아어]서|라서|"
+            r"(?:으)?면|다면|"
+            r"는?데|지(?:만)?|"
+            r"면서|다가|자마자|거나|거든|"
+            r"며|으며"
+            r")$"
+        )
+
+
+        recent_ko: dict[str, float] = {}
+
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "")).strip()
+
+        def _tok_count(s: str) -> int:
+            return len([t for t in _norm(s).split(" ") if t])
+
+        def ko_seen_recent(s: str) -> bool:
+            now = time.time()
+            # prune
+            for k, t in list(recent_ko.items()):
+                if now - t > DEDUP_WINDOW_S:
+                    recent_ko.pop(k, None)
+            hit = s in recent_ko and (now - recent_ko[s]) <= DEDUP_WINDOW_S
+            if not hit:
+                recent_ko[s] = now
+            return hit
+
+        src_tr = (src_stt.split("-")[0] or "ko").lower()
+        committer = ClauseCommitter(
+            CommitConfig(
+                max_elapsed_s=12.0,
+                max_chars=42,
+                commit_on_tail_ender=True,
+                commit_on_tail_marker=True,     # keep ON; coalescer smooths it
+                allow_internal_marker_split=True,
+                translate_on_server=False,
+            ),
+            lang=src_tr,
+        )
+
+        # --- coalescer ---
+        pending_commit: Optional[str] = None
+        commit_task: Optional[asyncio.Task] = None
+
+        async def _send_commit_now(ko_text: str) -> bool:
+            txt = _norm(ko_text)
+            if not txt:
+                return False
+            if ko_seen_recent(txt):
+                logger.info("skip duplicate commit: %r", txt)
+                return False
+
+            # Remember “longest so far” for this utterance (prefix dedup)
+            nonlocal last_utter_prefix
+            if txt.startswith(last_utter_prefix):
+                last_utter_prefix = txt
+            elif last_utter_prefix.startswith(txt):
+                # keep the longer one
+                pass
+            else:
+                # different branch; just set to the longer of the two
+                last_utter_prefix = max(last_utter_prefix, txt, key=len)
+
+            payload = {"type": "commit", "payload": txt, "src": "ko", "dst": dst_tr}
+            try:
+                await ws.send_json(payload)
+            except Exception as e:
+                logger.warning("producer send commit failed: %s", e)
+            try:
+                await broadcast(payload)
+            except Exception as e:
+                logger.warning("broadcast commit failed: %s", e)
+            return True
+
+
+        async def flush_pending_commit():
+            """Immediately send whatever is currently buffered by the coalescer."""
+            global pending_commit, commit_task
+            if commit_task and not commit_task.done():
+                commit_task.cancel()
+            snap = _norm(pending_commit or "")
+            pending_commit = None
+            if snap:
+                await _send_commit_now(snap)
+                
+        async def schedule_commit(ko_text: str):
+            nonlocal pending_commit, commit_task
+            txt = _norm(ko_text)
+            if not txt:
+                return
+
+            if _tok_count(txt) < MIN_COMMIT_TOKENS or len(txt) < MIN_COMMIT_CHARS:
+                return
+
+            # block only hanging tails (use the strict regex above)
+            if CONNECTIVE_TAIL.search(txt):
+                return
+
+            pending_commit = txt
+            if commit_task and not commit_task.done():
+                commit_task.cancel()
+
+            async def _wait_then_send(snap: str):
+                try:
+                    await asyncio.sleep(COALESCE_MS / 1000.0)
+                    if pending_commit == snap:
+                        await _send_commit_now(snap)
+                except asyncio.CancelledError:
+                    pass
+
+            commit_task = asyncio.create_task(_wait_then_send(pending_commit))
+
+
+        async def flush_pending_commit():
+            """Immediately emit the buffered commit (if any) and clear it."""
+            nonlocal pending_commit, commit_task, commit_used
+            if commit_task and not commit_task.done():
+                commit_task.cancel()
+            snap = _norm(pending_commit or "")
+            pending_commit = None
+            if snap:
+                sent = await _send_commit_now(snap)
+                if sent:
+                    commit_used = True
 
         try:
-            src_tr = (src_stt.split("-")[0] or "ko").lower()
             while True:
                 msg = await stt_out.get()
                 t = msg.get("type")
 
                 if t == "__stt_done__":
+                    # flush both the committer and coalescer, then finish
+                    flushed = committer.force_flush()
+                    if flushed:
+                        await flush_pending_commit()
+                        await _send_commit_now(flushed)
+                        commit_used = True
+                    else:
+                        await flush_pending_commit()
                     break
 
-                if t == "__stt_rollover__":
+                elif t == "__stt_rollover__":
+                    # utterance boundary; flush remainder
+                    flushed = committer.force_flush()
+                    if flushed:
+                        await flush_pending_commit()
+                        sent = await _send_commit_now(flushed)
+                        if sent:
+                            commit_used = True
+                    else:
+                        await flush_pending_commit()
+
+                    # Only emit source final here (NO fast_final on rollover)
                     if pending_interim and pending_interim.strip():
                         seq += 1
                         src_text = pending_interim.strip()
-
                         await ws.send_json({"type": "final_kr", "text": src_text, "seq": seq})
                         await broadcast({"type": "final_kr", "text": src_text, "seq": seq})
 
-                        hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
-                        dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
-
-                        fast = {"type":"fast_final","en":dst_text,"from":"google","dst":dst_tr,
-                                "origin":origin,"score":score,"seq":seq}
-                        live = {"mode":"live","text":dst_text,"seq":seq,
-                                "src":{"text":src_text,"lang":src_tr},
-                                "tgt":{"lang":dst_tr},"origin":origin,"score":score}
-                        await ws.send_json(fast)
-                        await broadcast(fast)
-                        await broadcast(live)
-
+                    # reset for next utterance
+                    committer.reset_for_new_utterance()  # ⬅️ important
                     pending_interim = None
+                    commit_used = False
+                    sent_fast_final = False
                     continue
 
-                if t == "interim":
-                    pending_interim = msg.get("text", "")
+                elif t == "__speech_activity_end__":
+                    # end of speech → flush immediately (but do NOT reset utterance state here)
+                    flushed = committer.force_flush()
+                    if flushed:
+                        await flush_pending_commit()
+                        sent = await _send_commit_now(flushed)
+                        if sent:
+                            commit_used = True
+                    else:
+                        await flush_pending_commit()
+                    continue
+
+                elif t == "interim":
+                    pending_interim = msg.get("text", "") or ""
+                    # mirror interim
                     payload = {"type": "interim_kr", "text": pending_interim}
                     await ws.send_json(payload)
                     await broadcast(payload)
+
+                    # eager commit (coalesced)
+                    c = committer.feed(pending_interim)
+                    if c:
+                        await schedule_commit(c)
                     continue
 
-                # t == "final"
-                src_text = (msg.get("text") or "").strip()
-                if not src_text:
+                elif t == "final":
+                    src_text = (msg.get("text") or "").strip()
+
+                    # ask committer for any leftover; DO NOT blindly resend full text
+                    flushed = committer.force_flush() or ""
+
+                    # coalesce any scheduled commit first
+                    await flush_pending_commit()
+
+                    # Compute remainder after the longest already-sent prefix
+                    remainder = ""
+                    if flushed and last_utter_prefix and flushed.startswith(last_utter_prefix):
+                        remainder = _norm(flushed[len(last_utter_prefix):])
+                    elif flushed and not last_utter_prefix:
+                        # No early commit in this utterance → we could allow a commit,
+                        # but fast_final will speak anyway; prefer to skip here.
+                        remainder = ""
+
+                    if remainder and len(remainder) >= MIN_COMMIT_CHARS and _tok_count(remainder) >= MIN_COMMIT_TOKENS:
+                        sent = await _send_commit_once(remainder)
+                        if sent:
+                            commit_used = True
+
+                    # Always surface the source final for UI
+                    if src_text:
+                        seq += 1
+                        curr = seq
+                        pending_interim = None
+                        await ws.send_json({"type": "final_kr", "text": src_text, "seq": curr})
+                        await broadcast({"type": "final_kr", "text": src_text, "seq": curr})
+
+                        # Only send fast_final if NO commit for this utterance
+                        if not commit_used and not sent_fast_final:
+                            hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
+                            dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
+                            fast = {
+                                "type": "fast_final", "en": dst_text, "from": "google", "dst": dst_tr,
+                                "origin": origin, "score": score, "seq": curr
+                            }
+                            await ws.send_json(fast)
+                            await broadcast(fast)
+                            await broadcast({
+                                "mode": "live", "text": dst_text, "seq": curr,
+                                "src": {"text": src_text, "lang": src_tr},
+                                "tgt": {"lang": dst_tr}, "origin": origin, "score": score,
+                            })
+                            sent_fast_final = True
+
+                    # reset utterance state
+                    last_utter_prefix = ""
+                    commit_used = False
+                    sent_fast_final = False
                     continue
-
-                seq += 1
-                curr = seq
-                pending_interim = None
-
-                payload_final = {"type": "final_kr", "text": src_text, "seq": curr}
-                await ws.send_json(payload_final)
-                await broadcast(payload_final)
-
-                hyb = await match_and_translate(src_text, target_lang=dst_tr or "en")
-                dst_text = hyb["text"]; origin = hyb["origin"]; score = round(hyb["score"], 4)
-
-                payload_fast = {
-                    "type": "fast_final",
-                    "en": dst_text,
-                    "from": "google",
-                    "dst": dst_tr,
-                    "origin": origin,
-                    "score": score,
-                    "seq": curr,
-                }
-                await ws.send_json(payload_fast)
-                await broadcast(payload_fast)
-
-                live_msg_new = {
-                    "mode": "live",
-                    "text": dst_text,
-                    "seq": curr,
-                    "src": {"text": src_text, "lang": src_tr},
-                    "tgt": {"lang": dst_tr},
-                    "origin": origin,
-                    "score": score,
-                }
-                await broadcast(live_msg_new)
+                else:
+                    continue
 
         except Exception as e:
             if "timed out after receiving no more client requests" in str(e).lower():
@@ -342,6 +572,8 @@ async def ws_translate(ws: WebSocket):
             else:
                 logger.exception("STT supervisor error: %s", e)
         finally:
+            # just in case
+            await flush_pending_commit()
             logger.info("STT supervisor finished")
 
 
@@ -351,6 +583,7 @@ async def ws_translate(ws: WebSocket):
     for t in pending:
         t.cancel()
     logger.info("WS handler return")
+
 
 # ------------------------------------------------------------------------------
 # Producer: /ws/stt/deepgram
@@ -577,10 +810,15 @@ async def debug_broadcast():
 
 # ==================Google Translation============================
 
-@app.post("/api/translate")
-async def translate_endpoint(body: KRIn):
-    en = translate_kr_to_en(body.text_kr, use_glossary=True)
-    return {"en": en}
+@app.post("/api/translate", response_model=TranslateRes)
+async def translate_endpoint(body: TranslateReq):
+    try:
+        out = translate_text_generic(
+            text=body.text, source_lang=body.src, target_lang=body.dst
+        )
+        return {"text": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"translate failed: {e}")
 
 # ---- Speech-to-Text (file) ----
 @app.post("/api/stt-file")
@@ -600,8 +838,12 @@ class TTSIn(BaseModel):
 @app.post("/api/tts")
 async def tts_endpoint(body: TTSIn):
     audio = tts_en_to_mp3(body.text, voice_name=body.voice or "en-US-Wavenet-D")
-    return StreamingResponse(iter([audio]), media_type="audio/mpeg")
-
+    return Response(
+        content=audio,
+        media_type="audio/mpeg",
+        headers={"Content-Length": str(len(audio)), "Cache-Control": "no-store"},
+    )
+    
 # ---- Utilities ----
 @app.get("/api/tts/voices")
 async def voices():
