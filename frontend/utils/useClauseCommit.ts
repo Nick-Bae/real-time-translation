@@ -26,6 +26,9 @@ const COMMIT_ENDINGS = /(습니다|ㅂ니다|였(다|어요?)|했(다|어요?)|�
 const HOLD_ENDINGS =
   /(기\s*때문에|때문에|다면|면|으면|는데|는데요?|지만|려고|면서|다가|자마자|거나|거든|라서|아서|어서|니까|으니까|며|으며)\s*$/;
 
+// commit cause clauses once "…때문에" is spoken so we don't hold overly long sentences
+const BECAUSE_ENDING = /(기\s*때문에|때문에)\s*$/
+
 // adverbs we should not force-commit after
 const ADVERB_TAIL =
   /(정말|진짜|아주|매우|너무|대단히|굉장히|열심히|잘|많이|조금|약간)$/;
@@ -80,6 +83,10 @@ function findBoundary(text: string): { cut: number; reason?: string } {
       text.lastIndexOf('。')
     )
     return { cut: idx >= 0 ? idx + 1 : -1, reason: 'punct' }
+  }
+  const becauseMatch = text.match(BECAUSE_ENDING)
+  if (becauseMatch && becauseMatch.index !== undefined) {
+    return { cut: becauseMatch.index + becauseMatch[0].length, reason: 'because-clause' }
   }
   // Polite/final endings (only if not connective)
   if (!HOLD_ENDINGS.test(text)) {

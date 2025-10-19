@@ -59,7 +59,8 @@ KO_CONNECTIVE_HANGING_RE = re.compile(
     r"(?:으)?니?$|[아어]서?$|라서?$|"
     r"면서?$|다가?$|자마자?$|거나?$|거든?$|"
     r"며$|으며?$|"
-    r"(?:으)?면?$|다면?$)"
+    r"(?:으)?면?$|다면?$|"
+    r"(?:했|하|되(?:었)?|해)\s*기$)"
 )
 
 
@@ -71,6 +72,27 @@ KO_SUSPECT_TAIL_RE = re.compile(
     r"(?:은|는|이|가|을|를|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|같이|"
     r"정말|진짜|아주|매우|너무|굉장히|잘|많이|조금|약간)\s*$"
 )
+
+# --- New: topic/marker head right after a connective (we should NOT include it in the commit)
+NEXT_TOPIC_OR_MARKER_RE = re.compile(
+    r"^\s*(?:그리고|근데|그런데|그러나|하지만|그래서|그러니까|그럼|그때|또|"
+    r"(?:오늘|내일|어제|지금|여기|거기|우리|저|나)[는]|"   # common topics
+    r"[^\s]+(?:은|는))"                                      # any token ending with 은/는
+)
+
+def _trim_after_connective(left: str, right: str) -> tuple[str, str]:
+    """
+    If 'left' ends at a full connective and 'right' begins with a topic/marker (내일은/그리고/…),
+    keep only the connective in 'left' and push the topic/marker back to 'right'.
+    """
+    if not left:
+        return _norm(left), right
+    # left ended at a *full* connective boundary (not hanging)
+    if KO_CONNECTIVE_BOUNDARY_RE.search(left) and not KO_CONNECTIVE_HANGING_RE.search(left):
+        m = NEXT_TOPIC_OR_MARKER_RE.match(right or "")
+        if m:
+            return _norm(left), (right or "")
+    return _norm(left), right
 
 def _ends_with_ko_ender(s: str) -> bool:
     return any(s.endswith(end) for end in KO_ENDERS)
@@ -112,7 +134,9 @@ def _last_safe_split(s: str) -> Optional[int]:
             j += 1
             break
         # ignore if still hanging
-        if not KO_CONNECTIVE_HANGING_RE.search(txt[:k]):
+        snippet = txt[:j]
+        base = _rstrip_tail_punct(snippet)
+        if not KO_CONNECTIVE_HANGING_RE.search(base):
             last_k = j
     return last_k
 
@@ -141,9 +165,13 @@ class ClauseCommitter:
     
     def reset_for_new_utterance(self):
         self.buf = ""
-        self.last_left_len = 0
-        self.last_emitted_left = ""
+        # If you track “last_left_len” or “last_emitted_left”, reset them too:
+        if hasattr(self, "last_left_len"):
+            self.last_left_len = 0
+        if hasattr(self, "last_emitted_left"):
+            self.last_emitted_left = ""
         self.last_commit_at = time.time()
+
 
     @property
     def markers(self) -> Sequence[str]:
@@ -154,6 +182,13 @@ class ClauseCommitter:
         t = (s or "").rstrip()
         if not t:
             return False
+        if not self.lang.startswith("en"):
+            base = _rstrip_tail_punct(t)
+            # avoid treating hanging connective compounds as finished (e.g., "...했기.", "...이기.")
+            if KO_CONNECTIVE_HANGING_RE.search(base):
+                return False
+            if base.endswith("기") and len(base) > 1:
+                return False
         if self.lang.startswith("en"):
             return t[-1] in EN_END_PUNCT
         if t and t[-1] in ".?!…‥。！？」":
@@ -235,11 +270,25 @@ class ClauseCommitter:
         if not self.lang.startswith("en"):
             k = _last_safe_split(self.buf)
             if k and k > self.last_left_len:
-                left = self.buf[:k].rstrip()
-                right = self.buf[k:].lstrip()
-                if len(_norm(left)) >= 6 and self._should_emit(left):
-                    self.buf = right
-                    return self._emit(left)
+                buf_snapshot = self.buf
+                left = buf_snapshot[:k].rstrip()
+                right = buf_snapshot[k:].lstrip()
+
+                # NEW: don't leak the next topic/marker after a connective
+                left, right = _trim_after_connective(left, right)
+
+                if len(_norm(left)) >= 6:
+                    # Avoid emitting subordinate-only fragments like “…기 때문에.”
+                    left_core = _rstrip_tail_punct(left)
+                    if not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
+                        # keep full buffer; wait for the main clause
+                        self.buf = buf_snapshot
+                    else:
+                        self.buf = right
+                        self.last_commit_at = time.time()
+                        self.last_left_len = len(left)
+                        return _norm(left)
+
 
         # 3) Full sentence enders
         if self.cfg.commit_on_tail_ender and self._is_tail_ender(self.buf):

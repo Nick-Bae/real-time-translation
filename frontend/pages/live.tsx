@@ -1,9 +1,10 @@
 // frontend/pages/live.tsx
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { startMicStream } from "../lib/useMicTranslate";
 import { useAudioQueue } from "../lib/useAudioQueue";
+import { API_URL, WS_URL } from "../utils/urls";
 
 type Lang = { label: string; stt: string; tr: string };
 type FastFinalMsg = {
@@ -32,8 +33,8 @@ const VOICE_BY_TR: Record<string, string> = {
   zh: "cmn-CN-Wavenet-A",
 };
 
-const API = process.env.NEXT_PUBLIC_API_BASE_URL!;
-const WS_BASE = process.env.NEXT_PUBLIC_WS_URL!;
+const API = API_URL;
+const WS_BASE = WS_URL;
 
 export default function Live() {
   // UI state
@@ -55,16 +56,16 @@ export default function Live() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const ctlRef = useRef<ReturnType<typeof startMicStream> | null>(null);
   const { enqueue, clear } = useAudioQueue(audioRef);
-  const seqRef = useRef<number>(1);
   const lastCommitAtRef = useRef<number>(0);
 
   const COMMIT_GRACE_MS = 3000; // use this consistent window
-  const recentKoCommitsRef = useRef<Map<string, number>>(new Map());
+  const COMMIT_SPEAK_DELAY_MS = 600; // allow quick replacements before TTS fires
   const recentEnPlayedRef = useRef<Map<string, number>>(new Map());
   // Keep one EN per KO clause (within a short window)
   const enByKoRef = useRef<Map<string, { en: string; spoken: boolean; ts: number }>>(new Map());
   const lastKoKeyRef = useRef<string | null>(null);
   const spokenSeqsRef = useRef<Set<number>>(new Set());
+  const pendingCommitTimersRef = useRef<Map<string, number>>(new Map());
 
   const KO_WINDOW_MS = 5000; // treat EN updates for the same KO within 5s as the same clause
 
@@ -97,6 +98,55 @@ export default function Live() {
     const now = Date.now();
     for (const [k, v] of map) if (now - v.ts > windowMs) map.delete(k);
   }
+
+  function clearPendingCommitTimer(key: string) {
+    const pending = pendingCommitTimersRef.current.get(key);
+    if (pending !== undefined) {
+      window.clearTimeout(pending);
+      pendingCommitTimersRef.current.delete(key);
+    }
+  }
+
+  function scheduleCommitSpeak(key: string, enText: string) {
+    clearPendingCommitTimer(key);
+    const timerId = window.setTimeout(() => {
+      pendingCommitTimersRef.current.delete(key);
+      void (async () => {
+        try {
+          const ttsRes = await fetch(`${API}/api/tts`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: enText,
+              voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+            }),
+          });
+          if (!ttsRes.ok) throw new Error(`TTS ${ttsRes.status} ${ttsRes.statusText}`);
+          const ab = await ttsRes.arrayBuffer();
+          if (ab.byteLength > 0) {
+            enqueue({ arrayBuffer: ab });
+          }
+          const stamp = Date.now();
+          for (const [k, t] of recentEnPlayedRef.current) {
+            if (stamp - t > DEDUP_WINDOW_MS) recentEnPlayedRef.current.delete(k);
+          }
+          recentEnPlayedRef.current.set(enText, stamp);
+          enByKoRef.current.set(key, { en: enText, spoken: true, ts: Date.now() });
+        } catch (err) {
+          console.error("[COMMIT] TTS error", err);
+          enByKoRef.current.set(key, { en: enText, spoken: false, ts: Date.now() });
+        }
+      })();
+    }, COMMIT_SPEAK_DELAY_MS);
+    pendingCommitTimersRef.current.set(key, timerId);
+  }
+
+  useEffect(() => {
+    return () => {
+      pendingCommitTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pendingCommitTimersRef.current.clear();
+    };
+  }, []);
 
 
   function errorMessage(err: unknown): string {
@@ -141,7 +191,65 @@ export default function Live() {
         async (m: any) => {
           console.log("[WS IN]", m.type, m);
           if (m.type === "interim_kr") setKrInterim(m.text);
-          if (m.type === "final_kr") setKrFinal(m.text);
+          if (m.type === "final_kr") {
+            const tailKo = normKo((m as any).text || "");
+            setKrFinal(tailKo);
+
+            // If we had an early clause commit for this utterance,
+            // speak ONLY the tail (suffix) on final_kr.
+            const now = Date.now();
+            const hadRecentCommit = now - (lastCommitAtRef.current || 0) < KO_WINDOW_MS;
+            if (!hadRecentCommit || !tailKo) {
+              // No early commit → the upcoming fast_final (if any) will handle TTS.
+              // Or empty tail.
+              // Just update UI and return.
+              // setEn is handled elsewhere by fast_final or commit.
+              // (Do nothing here.)
+            } else {
+              try {
+                const srcCode = LANGS[srcIdx].tr;
+                const dstCode = LANGS[dstIdx].tr;
+                const trRes = await fetch(`${API}/api/translate`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text: tailKo, src: srcCode, dst: dstCode }),
+                });
+                if (!trRes.ok) throw new Error(`translate ${trRes.status} ${trRes.statusText}`);
+                const trJson = await trRes.json().catch(() => ({} as any));
+                const enText =
+                  (typeof trJson?.text === "string" && trJson.text) ||
+                  (typeof trJson?.translated === "string" && trJson.translated) ||
+                  (typeof trJson?.en === "string" && trJson.en) ||
+                  "";
+                const enNorm = normEn(enText);
+                if (!enNorm) return;
+
+                // Update UI as a new segment (suffix)
+                setEn(enNorm);
+                setSegments((prev) => {
+                  if (!prev.length) return [enNorm];
+                  return [...prev, enNorm];
+                });
+
+                // Dedup: avoid replaying the same EN within a short window
+                if (seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) return;
+
+                const ttsRes = await fetch(`${API}/api/tts`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    text: enNorm,
+                    voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+                  }),
+                });
+                if (!ttsRes.ok) throw new Error(`TTS ${ttsRes.status} ${ttsRes.statusText}`);
+                const ab = await ttsRes.arrayBuffer();
+                if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
+              } catch (err) {
+                console.error("[final_kr suffix TTS]", err);
+              }
+            }
+          }
 
           // Prevent fast_final from stomping on a fresh commit
           if (m.type === "fast_final") {
@@ -217,103 +325,98 @@ export default function Live() {
             try {
               console.log("[COMMIT] raw:", m);
 
-              lastCommitAtRef.current = Date.now();
-
-              // 1) Normalize KO, compute stable KO key, remember it for fast_final merges
-              const koClauseRaw = typeof m.payload === "string" ? m.payload : "";
-              const koClause = normKo(koClauseRaw);
-              if (!koClause) return;
-
-              if (seenRecently(recentKoCommitsRef.current, koClause, DEDUP_WINDOW_MS)) {
-                console.log("[COMMIT] dedup KO (skip)", koClause);
+              // --- timing guard: ignore stale commits
+              const tsMs = typeof (m as any).ts_ms === "number" ? (m as any).ts_ms : Date.now();
+              if (tsMs < (lastCommitAtRef.current || 0)) {
+                console.log("[COMMIT] stale (ts)", tsMs, "<", lastCommitAtRef.current);
                 return;
               }
+              lastCommitAtRef.current = tsMs;
 
-              const key = koKey(koClause);
+              // --- normalize KO
+              const rawKo = typeof (m as any).payload === "string" ? (m as any).payload : "";
+              const koClause = normKo(rawKo);
+              if (!koClause) return;
+              setKrFinal(koClause);
+
+              // --- stable key & caches
+              const isReplace = !!(m as any).replace;
+              const prevKey = lastKoKeyRef.current;
+              let key = koKey(koClause);
+              if (isReplace && prevKey) {
+                key = prevKey;
+              }
               lastKoKeyRef.current = key;
               purgeOldKo(enByKoRef.current);
 
-              const srcCode = LANGS[srcIdx].tr; // "ko"
-              const dstCode = LANGS[dstIdx].tr; // "en"
-
-              // 2) Translate
-              const trRes = await fetch(`${API}/api/translate`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: koClause, src: srcCode, dst: dstCode }),
-              });
-              if (!trRes.ok) {
-                const eTxt = await trRes.text().catch(() => "");
-                console.error("[COMMIT] translate failed:", trRes.status, eTxt);
-                return;
+              // --- get EN: prefer server-provided; else translate here
+              let enText = "";
+              if (typeof (m as any).en === "string" && (m as any).en.trim()) {
+                enText = (m as any).en;
+              } else {
+                const srcCode = LANGS[srcIdx].tr; // "ko"
+                const dstCode = LANGS[dstIdx].tr; // "en"
+                const trRes = await fetch(`${API}/api/translate`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ text: koClause, src: srcCode, dst: dstCode }),
+                });
+                if (!trRes.ok) {
+                  console.warn("[COMMIT] translate failed", trRes.status);
+                  return;
+                }
+                const trJson = await trRes.json().catch(() => ({} as any));
+                enText =
+                  (typeof trJson?.text === "string" && trJson.text) ||
+                  (typeof trJson?.translated === "string" && trJson.translated) ||
+                  (typeof trJson?.en === "string" && trJson.en) ||
+                  "";
               }
-              const trJson = await trRes.json().catch(() => ({} as any));
-              const enText =
-                (typeof trJson?.text === "string" && trJson.text) ||
-                (typeof trJson?.translated === "string" && trJson.translated) ||
-                (typeof trJson?.en === "string" && trJson.en) ||
-                "";
               const enNorm = normEn(enText);
-              if (!enNorm) {
-                console.warn("[COMMIT] empty EN");
-                return;
-              }
+              if (!enNorm) return;
 
-              // 3) Coalesce by KO key: replace last UI line if we already showed a preview/older EN
+              // --- replace vs append
               const existing = enByKoRef.current.get(key);
+
               setEn(enNorm);
               setSegments((prev) => {
                 if (!prev.length) return [enNorm];
-                if (existing) {
-                  // last segment belongs to this KO (fast_final preview or earlier commit): replace it
+                if (isReplace || existing) {
                   const copy = prev.slice();
-                  copy[copy.length - 1] = enNorm;
+                  copy[copy.length - 1] = enNorm; // refine/replace
                   return copy;
                 }
-                // if identical to last, keep list stable
-                if (normEn(prev[prev.length - 1]) === enNorm) return prev;
-                return [...prev, enNorm];
+                if (normEn(prev[prev.length - 1]) === enNorm) return prev; // exact duplicate
+                return [...prev, enNorm]; // new clause
               });
 
-              // 4) Speak once per KO key (commit path is authoritative)
-              let speak = !existing?.spoken;
+              const nowTs = Date.now();
+              const prevEn = existing?.en ? normEn(existing.en) : "";
+              const enChanged = prevEn !== enNorm;
+              const wasSpoken = existing?.spoken ?? false;
 
-              // keep your “recent EN spoken” dedup as an extra guard
-              if (speak && seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
+              let shouldSpeak = enChanged || !wasSpoken;
+              if (!enChanged && seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
                 console.log("[COMMIT] dedup EN (skip TTS)", enNorm);
-                speak = false;
+                shouldSpeak = false;
               }
 
-              if (speak) {
-                const ttsRes = await fetch(`${API}/api/tts`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    text: enNorm,
-                    voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
-                  }),
-                });
+              enByKoRef.current.set(key, {
+                en: enNorm,
+                spoken: shouldSpeak ? false : true,
+                ts: nowTs,
+              });
 
-                if (ttsRes.ok) {
-                  const ab = await ttsRes.arrayBuffer();
-                  if (ab.byteLength > 0) {
-                    enqueue({ arrayBuffer: ab });
-                    enByKoRef.current.set(key, { en: enNorm, spoken: true, ts: Date.now() });
-                  } else {
-                    enByKoRef.current.set(key, { en: enNorm, spoken: false, ts: Date.now() });
-                  }
-                } else {
-                  console.warn("[COMMIT] TTS failed", ttsRes.status);
-                  enByKoRef.current.set(key, { en: enNorm, spoken: false, ts: Date.now() });
-                }
+              if (shouldSpeak) {
+                scheduleCommitSpeak(key, enNorm);
               } else {
-                // Already spoken (or dedupbed): just update cache with latest text/time
-                enByKoRef.current.set(key, { en: enNorm, spoken: true, ts: Date.now() });
+                clearPendingCommitTimer(key);
               }
             } catch (e) {
               console.error("[COMMIT] error:", e);
             }
           }
+
           // Optional: if backend sends already-translated chunks
           if (m.type === "translation") {
             const enText = String(m.payload || "");
