@@ -347,6 +347,9 @@ async def ws_translate(ws: WebSocket):
             prefix = _norm(committed_prefix)
             if prefix and f.startswith(prefix):
                 return _norm(f[len(prefix):])
+            core_prefix = prefix.rstrip(" .,!?:;…‥、。！？」］)}]“”‘’'\"")
+            if core_prefix and f.startswith(core_prefix):
+                return _norm(f[len(core_prefix):])
             return f
 
         def _norm(s: str) -> str:
@@ -424,13 +427,23 @@ async def ws_translate(ws: WebSocket):
             if not txt:
                 return False
 
+            send_txt = txt
+            tail_only = False
+            if ko_committed_prefix:
+                tail_candidate = _tail_after_commits(txt, ko_committed_prefix)
+                if tail_candidate != txt:
+                    send_txt = tail_candidate
+                    tail_only = True
+            if not send_txt:
+                return False
+
             now = time.time()
 
             # exact dup guard
-            if recent_commit_text and norm_ws(recent_commit_text) == txt and (now - recent_commit_time) < 3.0:
+            if recent_commit_text and norm_ws(recent_commit_text) == send_txt and (now - recent_commit_time) < 3.0:
                 return False
 
-            base_txt = strip_trail_punct(txt)
+            base_txt = strip_trail_punct(send_txt)
             if base_txt.endswith("기") and len(base_txt) > 1:
                 # wait for the connective tail (e.g., “…기 때문에”)
                 return False
@@ -444,20 +457,20 @@ async def ws_translate(ws: WebSocket):
                 return s[:i]
 
             replace = False
-            if recent_commit_text:
+            if not tail_only and recent_commit_text:
                 prev_norm = norm_ws(recent_commit_text)
                 prev_base = strip_trail_punct(prev_norm)
-                if txt.startswith(prev_base) and len(txt) > len(prev_norm):
+                if send_txt.startswith(prev_base) and len(send_txt) > len(prev_norm):
                     replace = True
-                elif is_variant(prev_norm, txt):
+                elif is_variant(prev_norm, send_txt):
                     replace = True
 
-            recent_commit_text = txt
+            recent_commit_text = send_txt
             recent_commit_time = now
 
             payload = {
                 "type": "commit",
-                "payload": txt,
+                "payload": send_txt,
                 "src": "ko",
                 "dst": dst_tr,
                 "replace": replace,
@@ -475,9 +488,13 @@ async def ws_translate(ws: WebSocket):
 
             # Update the committed KO prefix so finals can skip already-spoken clauses
             if replace:
-                ko_committed_prefix = txt
+                ko_committed_prefix = send_txt
             else:
-                ko_committed_prefix = norm_ws(f"{ko_committed_prefix} {txt}") if ko_committed_prefix else txt
+                if ko_committed_prefix:
+                    base = strip_trail_punct(ko_committed_prefix)
+                    ko_committed_prefix = norm_ws(f"{base} {send_txt}")
+                else:
+                    ko_committed_prefix = send_txt
 
             # Mark that we used a commit in this utterance
             commit_used = True

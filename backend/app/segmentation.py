@@ -243,6 +243,12 @@ class ClauseCommitter:
         prev = self.buf
         inc = interim
 
+        if prev:
+            prev_norm = _norm(prev)
+            inc_norm = _norm(inc)
+            if inc_norm and len(inc_norm) < len(prev_norm) and prev_norm.endswith(inc_norm):
+                inc = prev
+
         # 1) Split BEFORE a new tail marker (그런데/하지만/…) that just arrived
         if self.cfg.commit_on_tail_marker and not self.lang.startswith("en"):
             if prev and inc.startswith(prev):
