@@ -437,6 +437,14 @@ async def ws_translate(ws: WebSocket):
             if not send_txt:
                 return False
 
+            if tail_only:
+                if _tok_count(send_txt) < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS:
+                    return False
+
+            if _tok_count(send_txt) < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS:
+                if ko_committed_prefix:
+                    return False
+
             now = time.time()
 
             # exact dup guard
