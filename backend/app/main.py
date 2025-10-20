@@ -434,6 +434,14 @@ async def ws_translate(ws: WebSocket):
                 if tail_candidate != txt:
                     send_txt = tail_candidate
                     tail_only = True
+                else:
+                    base_prefix = strip_trail_punct(norm_ws(ko_committed_prefix))
+                    send_norm = norm_ws(txt)
+                    if base_prefix and send_norm.startswith(base_prefix):
+                        remainder = send_norm[len(base_prefix):].lstrip(" ,")
+                        if remainder:
+                            send_txt = remainder
+                            tail_only = True
             if not send_txt:
                 return False
 

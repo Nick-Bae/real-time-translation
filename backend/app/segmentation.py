@@ -136,8 +136,10 @@ def _last_safe_split(s: str) -> Optional[int]:
         # ignore if still hanging
         snippet = txt[:j]
         base = _rstrip_tail_punct(snippet)
-        if not KO_CONNECTIVE_HANGING_RE.search(base):
-            last_k = j
+        rest = txt[j:].lstrip()
+        if KO_CONNECTIVE_HANGING_RE.search(base) and not rest:
+            continue
+        last_k = j
     return last_k
 
 
