@@ -60,6 +60,7 @@ export default function Live() {
 
   const COMMIT_GRACE_MS = 3000; // use this consistent window
   const COMMIT_SPEAK_DELAY_MS = 600; // allow quick replacements before TTS fires
+  const TRANSLATION_FALLBACK_DELAY_MS = 1500; // give commits a chance before speaking translation previews
   const recentEnPlayedRef = useRef<Map<string, number>>(new Map());
   // Keep one EN per KO clause (within a short window)
   const enByKoRef = useRef<Map<string, { en: string; spoken: boolean; ts: number }>>(new Map());
@@ -107,7 +108,7 @@ export default function Live() {
     }
   }
 
-  function scheduleCommitSpeak(key: string, enText: string) {
+  function scheduleCommitSpeak(key: string, enText: string, delayMs = COMMIT_SPEAK_DELAY_MS) {
     clearPendingCommitTimer(key);
     const timerId = window.setTimeout(() => {
       pendingCommitTimersRef.current.delete(key);
@@ -137,7 +138,7 @@ export default function Live() {
           enByKoRef.current.set(key, { en: enText, spoken: false, ts: Date.now() });
         }
       })();
-    }, COMMIT_SPEAK_DELAY_MS);
+    }, delayMs);
     pendingCommitTimersRef.current.set(key, timerId);
   }
 
@@ -342,12 +343,25 @@ export default function Live() {
               // --- stable key & caches
               const isReplace = !!(m as any).replace;
               const prevKey = lastKoKeyRef.current;
-              let key = koKey(koClause);
+              const nextKey = koKey(koClause);
+              let key = nextKey;
+              let existingEntry = enByKoRef.current.get(nextKey);
               if (isReplace && prevKey) {
-                key = prevKey;
+                if (prevKey !== nextKey) {
+                  clearPendingCommitTimer(prevKey);
+                  const carried = enByKoRef.current.get(prevKey);
+                  if (carried) {
+                    existingEntry = carried;
+                    enByKoRef.current.delete(prevKey);
+                  }
+                } else {
+                  existingEntry = enByKoRef.current.get(prevKey);
+                }
               }
-              lastKoKeyRef.current = key;
+              lastKoKeyRef.current = nextKey;
+              key = nextKey;
               purgeOldKo(enByKoRef.current);
+              clearPendingCommitTimer(key);
 
               // --- get EN: prefer server-provided; else translate here
               let enText = "";
@@ -376,12 +390,10 @@ export default function Live() {
               if (!enNorm) return;
 
               // --- replace vs append
-              const existing = enByKoRef.current.get(key);
-
               setEn(enNorm);
               setSegments((prev) => {
                 if (!prev.length) return [enNorm];
-                if (isReplace || existing) {
+                if (isReplace || existingEntry) {
                   const copy = prev.slice();
                   copy[copy.length - 1] = enNorm; // refine/replace
                   return copy;
@@ -391,9 +403,9 @@ export default function Live() {
               });
 
               const nowTs = Date.now();
-              const prevEn = existing?.en ? normEn(existing.en) : "";
+              const prevEn = existingEntry?.en ? normEn(existingEntry.en) : "";
               const enChanged = prevEn !== enNorm;
-              const wasSpoken = existing?.spoken ?? false;
+              const wasSpoken = existingEntry?.spoken ?? false;
 
               let shouldSpeak = enChanged || !wasSpoken;
               if (!enChanged && seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
@@ -419,23 +431,78 @@ export default function Live() {
 
           // Optional: if backend sends already-translated chunks
           if (m.type === "translation") {
-            const enText = String(m.payload || "");
-            setEn(enText);
-            setSegments((prev) => [...prev, enText]);
+            const rawPayload =
+              typeof (m as any)?.payload === "string"
+                ? (m as any).payload
+                : String((m as any)?.payload ?? "");
+            const enNorm = normEn(rawPayload);
+            if (!enNorm) return;
+
+            const rawMetaKo =
+              typeof (m as any)?.meta?.original === "string"
+                ? (m as any).meta.original
+                : "";
+            const normMetaKo = normKo(rawMetaKo);
+            const key = normMetaKo ? koKey(normMetaKo) : null;
+            const now = Date.now();
+            purgeOldKo(enByKoRef.current);
+
+            for (const [k, t] of recentEnPlayedRef.current) {
+              if (now - t > DEDUP_WINDOW_MS) recentEnPlayedRef.current.delete(k);
+            }
+            const lastPlayed = recentEnPlayedRef.current.get(enNorm);
+            const isRecentDuplicate =
+              lastPlayed !== undefined && now - lastPlayed < DEDUP_WINDOW_MS;
+            const existing = key ? enByKoRef.current.get(key) : undefined;
+
+            setEn(enNorm);
+            setSegments((prev) => {
+              if (!prev.length) return [enNorm];
+              if (existing) {
+                const copy = prev.slice();
+                copy[copy.length - 1] = enNorm;
+                return copy;
+              }
+              const last = prev[prev.length - 1];
+              if (normEn(last) === enNorm) return prev;
+              return [...prev, enNorm];
+            });
+
+            if (key) {
+              const spoken = existing?.spoken ?? false;
+              enByKoRef.current.set(key, { en: enNorm, spoken, ts: now });
+
+              const hasPendingCommit = pendingCommitTimersRef.current.has(key);
+              if (hasPendingCommit || spoken) return;
+              if (isRecentDuplicate) return;
+
+              scheduleCommitSpeak(key, enNorm, TRANSLATION_FALLBACK_DELAY_MS);
+              return;
+            }
+
+            if (isRecentDuplicate) return;
+
             try {
               const res = await fetch(`${API}/api/tts`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  text: enText,
+                  text: enNorm,
                   voice:
                     VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
                 }),
               });
               if (!res.ok)
                 throw new Error(`TTS ${res.status} ${res.statusText}`);
-              const blob = await res.blob();
-              enqueue({ blob });
+              const ab = await res.arrayBuffer();
+              if (ab.byteLength > 0) {
+                enqueue({ arrayBuffer: ab });
+                const stamp = Date.now();
+                for (const [k, t] of recentEnPlayedRef.current) {
+                  if (stamp - t > DEDUP_WINDOW_MS) recentEnPlayedRef.current.delete(k);
+                }
+                recentEnPlayedRef.current.set(enNorm, stamp);
+              }
             } catch (err) {
               console.error(err);
             }

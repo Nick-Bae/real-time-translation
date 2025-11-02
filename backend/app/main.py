@@ -32,8 +32,9 @@ from app.segmentation import ClauseCommitter, CommitConfig
 from app.utils.translate import translate_text
 from app.routes import translate as translate_routes
 from app.routes import hybrid as hybrid_routes
-from app.hybrid_store import match_and_translate 
+from app.hybrid_store import best_match_ko
 from app.segmentation import _trim_after_connective
+from app.utils.google_translate import google_translate
 from app.services.google_services import (
     stt_kr_from_bytes_sync,
     translate_kr_to_en,
@@ -49,6 +50,79 @@ from app.services.google_services import (
 # ---- Optional: existing routers
 from app.routes import translate as translate_routes  # keeps your /api endpoints
 
+try:
+    # If you already have a prepared-script store
+    from app.prep_store import STORE   # adjust to your actual module, if different
+except Exception:
+    STORE = None
+
+from app.utils.google_translate import google_translate
+
+def _store_ready() -> bool:
+    try:
+        return STORE is not None and callable(getattr(STORE, "is_ready", None)) and STORE.is_ready()
+    except Exception:
+        return False
+
+async def hybrid_translate(text: str, src_lang: str = "ko", tgt_lang: str = "en") -> dict:
+    """
+    Try the admin-uploaded hybrid script first, fall back to legacy prep store, then Google Translate.
+    Returns: {"text", "mode", "origin", "score", "matched_source"}
+    """
+    text = (text or "").strip()
+    if not text:
+        return {
+            "text": "",
+            "mode": "realtime",
+            "origin": "google",
+            "score": 0.0,
+            "matched_source": None,
+        }
+
+    # 1) Admin-uploaded hybrid script (/api/script/upload)
+    try:
+        script_score, script_en, matched_src = best_match_ko(text)
+    except Exception:
+        script_score, script_en, matched_src = (0.0, None, None)
+
+    if script_en is not None:
+        return {
+            "text": script_en,
+            "mode": "pre",
+            "origin": "script",
+            "score": float(script_score),
+            "matched_source": matched_src or text,
+        }
+
+    # 2) Legacy prep store (if configured)
+    try:
+        if _store_ready():
+            score, pair, matched_src = STORE.best_match(text)
+            if score >= STORE.config.threshold and pair:
+                return {
+                    "text": pair.target,
+                    "mode": "pre",
+                    "origin": "script",
+                    "score": float(score),
+                    "matched_source": matched_src,
+                }
+    except Exception:
+        pass
+
+    # 3) Fallback: Google Translate (live)
+    loop = asyncio.get_running_loop()
+    translated = await loop.run_in_executor(None, google_translate, text, src_lang, tgt_lang)
+    return {
+        "text": translated,
+        "mode": "realtime",
+        "origin": "google",
+        "score": 0.0,
+        "matched_source": None,
+    }
+
+# Backward-compatible alias (since your code calls match_and_translate in fast_final)
+async def match_and_translate(text: str, source_lang: str = "ko", target_lang: str = "en") -> dict:
+    return await hybrid_translate(text, source_lang, target_lang)
 class TranslateReq(BaseModel):
     text: str = Field(..., description="Text to translate")
     src: str = Field(..., description="Source BCP-47 or ISO code, e.g. 'ko'")
@@ -155,6 +229,36 @@ class KRIn(BaseModel):
     text_kr: str
 
 # ------------------------------------------------------------------------------
+# WebSocket helpers
+# ------------------------------------------------------------------------------
+async def iter_binary_frames(ws: WebSocket, *, log_ctx: str = ""):
+    """Yield binary payloads while ignoring stray text frames from browsers."""
+    ctx = f"{log_ctx} " if log_ctx else ""
+    while True:
+        message = await ws.receive()
+        msg_type = message.get("type")
+
+        if msg_type == "websocket.receive":
+            chunk = message.get("bytes")
+            if chunk is not None:
+                if chunk:
+                    yield chunk
+                continue
+
+            if message.get("text"):
+                # Browsers sometimes send text/ping frames even on binary-only pipes.
+                logger.debug("%signoring unexpected text frame (%d chars)", ctx, len(message["text"]))
+            continue
+
+        if msg_type in {"websocket.disconnect", "websocket.close"}:
+            code = message.get("code", 1000)
+            raise WebSocketDisconnect(code)
+
+        # For completeness, treat anything else as disconnect so callers unwind.
+        raise WebSocketDisconnect()
+
+
+# ------------------------------------------------------------------------------
 # Debug endpoint: echo bytes back as counters (to verify WS + mic flow)
 # ------------------------------------------------------------------------------
 @app.websocket("/ws/echo-bytes")
@@ -162,7 +266,7 @@ async def ws_echo(ws: WebSocket):
     await ws.accept()
     total = 0
     try:
-        async for b in ws.iter_bytes():
+        async for b in iter_binary_frames(ws, log_ctx="/ws/echo-bytes"):
             n = len(b or b"")
             total += n
             # bounce a tiny JSON every ~10 chunks so browser prints something
@@ -220,9 +324,7 @@ async def ws_translate(ws: WebSocket):
     async def feeder():
         nonlocal closed
         try:
-            async for data in ws.iter_bytes():
-                if not data:
-                    continue
+            async for data in iter_binary_frames(ws, log_ctx="producer"):
                 try:
                     pcm_queue.put_nowait(data)
                 except queue.Full:
@@ -414,6 +516,28 @@ async def ws_translate(ws: WebSocket):
         # put this near your other constants/helpers
         DEDUP_WINDOW_S = 3.0
         TRAIL_PUNCT = " .,!?:;…‥、。！？」］)}]“”‘’'\""
+        SENTENCE_PUNCT = (".", "?", "!", "…", "‥", "。", "？", "！")
+        KO_SENTENCE_TAIL_SUFFIXES = (
+            "입니다",
+            "니다",
+            "습니까",
+            "습니다",
+            "예요",
+            "에요",
+            "아요",
+            "어요",
+            "요",
+            "죠",
+            "네요",
+            "였다",
+            "였어요",
+            "했습니다",
+            "했어요",
+            "합니다",
+            "합시다",
+            "합니까",
+            "다",
+        )
 
         def strip_trail_punct(s: str) -> str:
             i = len(s)
@@ -423,40 +547,58 @@ async def ws_translate(ws: WebSocket):
 
         async def send_commit_now(websocket, manager, dst_tr: str, ko_text: str) -> bool:
             nonlocal recent_commit_text, recent_commit_time, ko_committed_prefix, commit_used  # <— important
-            txt = norm_ws(ko_text)
+
+            # --- normalize and compute the exact Korean tail we want to commit (your existing logic) ---
+            def _WS_sub(s: str) -> str:
+                return re.sub(r"\s+", " ", (s or "")).strip()
+
+            def _looks_like_sentence_tail(s: str) -> bool:
+                txt = (s or "").strip()
+                if not txt:
+                    return False
+                if txt.endswith(SENTENCE_PUNCT):
+                    return True
+                core = strip_trail_punct(txt)
+                if not core:
+                    return False
+                return any(core.endswith(sfx) for sfx in KO_SENTENCE_TAIL_SUFFIXES)
+
+            txt = _WS_sub(ko_text)
             if not txt:
                 return False
 
             send_txt = txt
             tail_only = False
-            if ko_committed_prefix:
-                tail_candidate = _tail_after_commits(txt, ko_committed_prefix)
-                if tail_candidate != txt:
-                    send_txt = tail_candidate
-                    tail_only = True
-                else:
-                    base_prefix = strip_trail_punct(norm_ws(ko_committed_prefix))
-                    send_norm = norm_ws(txt)
-                    if base_prefix and send_norm.startswith(base_prefix):
-                        remainder = send_norm[len(base_prefix):].lstrip(" ,")
-                        if remainder:
-                            send_txt = remainder
-                            tail_only = True
+
+            # Keep your tail-after-commits logic
+            tail_candidate = _tail_after_commits(txt, ko_committed_prefix)
+            if tail_candidate != txt:
+                send_txt = tail_candidate
+                tail_only = True
+            else:
+                base_prefix = strip_trail_punct(_WS_sub(ko_committed_prefix))
+                send_norm = _WS_sub(txt)
+                if base_prefix and send_norm.startswith(base_prefix):
+                    remainder = send_norm[len(base_prefix):].lstrip(" ,")
+                    if remainder:
+                        send_txt = remainder
+                        tail_only = True
+
             if not send_txt:
                 return False
 
+            # Length/quality guards (your existing MIN_COMMIT_TOKENS/CHARS checks)
+            tok_count = _tok_count(send_txt)
+            short_clause = tok_count < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS
             if tail_only:
-                if _tok_count(send_txt) < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS:
+                if short_clause and not _looks_like_sentence_tail(send_txt):
                     return False
-
-            if _tok_count(send_txt) < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS:
-                if ko_committed_prefix:
-                    return False
+            elif short_clause and ko_committed_prefix:
+                return False
 
             now = time.time()
-
             # exact dup guard
-            if recent_commit_text and norm_ws(recent_commit_text) == send_txt and (now - recent_commit_time) < 3.0:
+            if recent_commit_text and _WS_sub(recent_commit_text) == send_txt and (now - recent_commit_time) < 3.0:
                 return False
 
             base_txt = strip_trail_punct(send_txt)
@@ -464,17 +606,10 @@ async def ws_translate(ws: WebSocket):
                 # wait for the connective tail (e.g., “…기 때문에”)
                 return False
 
-            # replace if current grows the previous (prefix growth)
-            def _strip_trail_punct(s: str) -> str:
-                TRAIL = " .,!?:;…‥、。！？」］)}]“”‘’'\""
-                i = len(s)
-                while i > 0 and s[i-1] in TRAIL:
-                    i -= 1
-                return s[:i]
-
+            # replace if current grows the previous (prefix growth / variant)
             replace = False
-            if not tail_only and recent_commit_text:
-                prev_norm = norm_ws(recent_commit_text)
+            if recent_commit_text:
+                prev_norm = _WS_sub(recent_commit_text)
                 prev_base = strip_trail_punct(prev_norm)
                 if send_txt.startswith(prev_base) and len(send_txt) > len(prev_norm):
                     replace = True
@@ -484,37 +619,101 @@ async def ws_translate(ws: WebSocket):
             recent_commit_text = send_txt
             recent_commit_time = now
 
-            payload = {
+            # 1) 🔁 HYBRID TRANSLATE the committed KO (needed for both KO + EN fanout)
+            hyb = await hybrid_translate(send_txt, src_lang="ko", tgt_lang=dst_tr or "en")
+            dst_text = hyb["text"]
+            mode = hyb["mode"]            # "pre" | "realtime"
+            score = float(hyb["score"])
+            matched_source = hyb.get("matched_source")
+            origin = hyb.get("origin", "google")
+
+            # 2) Send the KO commit (now enriched with EN + metadata so producers can skip HTTP translate)
+            ko_payload = {
                 "type": "commit",
                 "payload": send_txt,
                 "src": "ko",
                 "dst": dst_tr,
                 "replace": replace,
                 "ts_ms": int(now * 1000),
+                "en": dst_text,
+                "mode": mode,
+                "origin": origin,
+                "score": score,
             }
-
             try:
-                await websocket.send_json(payload)
+                await websocket.send_json(ko_payload)
             except Exception as e:
                 print("[producer] send commit failed:", e)
             try:
-                await manager.broadcast(payload)
+                await manager.broadcast(ko_payload)
             except Exception as e:
                 print("[broadcast] commit failed:", e)
+            try:
+                await broadcast(ko_payload)
+            except Exception as e:
+                logger.warning("[viewer] commit fanout failed: %s", e)
 
-            # Update the committed KO prefix so finals can skip already-spoken clauses
+            # (A) Standard event your React hook + viewer consumes
+            trans_payload = {
+                "type": "translation",
+                "lang": dst_tr or "en",
+                "payload": dst_text,
+                "meta": {
+                    "translated": dst_text,
+                    "mode": mode,
+                    "match_score": score,
+                    "matched_source": matched_source,
+                    "partial": False,
+                    "segment_id": None,
+                    "rev": None,
+                    "original": send_txt,
+                    "origin": origin,
+                },
+            }
+            try:
+                await websocket.send_json(trans_payload)
+            except Exception as e:
+                logger.warning("[producer] translation send failed: %s", e)
+            try:
+                await manager.broadcast(trans_payload)
+            except Exception as e:
+                print("[broadcast] translation failed:", e)
+            try:
+                await broadcast(trans_payload)
+            except Exception as e:
+                logger.warning("[viewer] translation fanout failed: %s", e)
+
+            # (B) (Optional) Your legacy schema for other listeners, if any
+            legacy_payload = {
+                "mode": ("prepared" if mode == "pre" else "live"),
+                "text": dst_text,
+                "src": {"text": send_txt, "lang": "ko"},
+                "tgt": {"lang": dst_tr or "en"},
+                "origin": origin,
+                "score": score,
+            }
+            try:
+                await manager.broadcast(legacy_payload)
+            except Exception:
+                pass
+            try:
+                await broadcast(legacy_payload)
+            except Exception as e:
+                logger.warning("[viewer] legacy fanout failed: %s", e)
+
+            # Update committed KO prefix so finals can skip already-spoken clauses
             if replace:
                 ko_committed_prefix = send_txt
             else:
                 if ko_committed_prefix:
                     base = strip_trail_punct(ko_committed_prefix)
-                    ko_committed_prefix = norm_ws(f"{base} {send_txt}")
+                    ko_committed_prefix = _WS_sub(f"{base} {send_txt}")
                 else:
                     ko_committed_prefix = send_txt
 
-            # Mark that we used a commit in this utterance
             commit_used = True
             return True
+
 
         
                 
@@ -852,6 +1051,11 @@ async def ws_stt_deepgram(websocket: WebSocket):
                 print(f"[BROADCAST] seq={seq} origin={origin} score={score} '{en[:60]}'")
             except Exception as e:
                 print("[DG] broadcast error:", e)
+            try:
+                await broadcast(live_msg_new)
+                await broadcast(live_msg_legacy)
+            except Exception as e:
+                logger.warning("[viewer] DG fanout failed: %s", e)
 
             pending_kr = None
             if pending_task and not pending_task.done():
@@ -951,6 +1155,8 @@ async def debug_broadcast():
     }
     await manager.broadcast(msg_new)
     await manager.broadcast(msg_legacy)
+    await broadcast(msg_new)
+    await broadcast(msg_legacy)
     return {"ok": True}
 
 # ==================Google Translation============================

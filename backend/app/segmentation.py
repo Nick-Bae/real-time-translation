@@ -53,14 +53,28 @@ KO_CONNECTIVE_BOUNDARY_RE = re.compile(
 
 
 # a *hanging* connective (don’t commit on these yet)
+# NOTE: Anchor alternatives so we never match the empty string; otherwise every sentence
+# tail would look like a hanging connective and prevent timely commits.
 KO_CONNECTIVE_HANGING_RE = re.compile(
-    r"(?:기\s*때(?:문|문에?$)|때(?:문|문에?$)|"
-    r"는?데$|지(?:만?$)|"
-    r"(?:으)?니?$|[아어]서?$|라서?$|"
-    r"면서?$|다가?$|자마자?$|거나?$|거든?$|"
-    r"며$|으며?$|"
-    r"(?:으)?면?$|다면?$|"
-    r"(?:했|하|되(?:었)?|해)\s*기$)"
+    r"(?:"
+    r"기\s*때(?:문|문에)|"
+    r"때(?:문|문에)|"
+    r"는?데|"
+    r"지(?:만)?|"
+    r"(?:으)?니|"
+    r"[아어]서|"
+    r"라서|"
+    r"면서|"
+    r"다가|"
+    r"자마자|"
+    r"거나|"
+    r"거든|"
+    r"며|"
+    r"으며|"
+    r"(?:으)?면|"
+    r"다면|"
+    r"(?:했|하|되(?:었)?|해)\s*기"
+    r")\s*$"
 )
 
 
@@ -70,7 +84,7 @@ KO_SENT_END_PUNCT_RE = re.compile(r"[．。!?…‥]$")
 # Particles/adverbs we avoid ending on unless a connective has matched
 KO_SUSPECT_TAIL_RE = re.compile(
     r"(?:은|는|이|가|을|를|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|같이|"
-    r"정말|진짜|아주|매우|너무|굉장히|잘|많이|조금|약간)\s*$"
+    r"정말|진짜|아주|매우|너무|굉장히|잘|많이|조금|약간|의)\s*$"
 )
 
 # --- New: topic/marker head right after a connective (we should NOT include it in the commit)
@@ -288,7 +302,9 @@ class ClauseCommitter:
                 if len(_norm(left)) >= 6:
                     # Avoid emitting subordinate-only fragments like “…기 때문에.”
                     left_core = _rstrip_tail_punct(left)
-                    if not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
+                    if KO_SUSPECT_TAIL_RE.search(left_core):
+                        self.buf = buf_snapshot
+                    elif not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
                         # keep full buffer; wait for the main clause
                         self.buf = buf_snapshot
                     else:
@@ -301,6 +317,9 @@ class ClauseCommitter:
         # 3) Full sentence enders
         if self.cfg.commit_on_tail_ender and self._is_tail_ender(self.buf):
             out = _norm(self.buf)
+            core = _rstrip_tail_punct(out)
+            if KO_SUSPECT_TAIL_RE.search(core):
+                return None
             if self._should_emit(out):
                 self.buf = ""
                 return self._emit(out)
@@ -323,11 +342,18 @@ class ClauseCommitter:
                 left = self.buf[:k].rstrip()
                 right = self.buf[k:].lstrip()
                 if len(_norm(left)) >= 6 and self._should_emit(left):
-                    self.buf = right
-                    return self._emit(left)
+                    left_core = _rstrip_tail_punct(left)
+                    if KO_SUSPECT_TAIL_RE.search(left_core):
+                        pass
+                    else:
+                        self.buf = right
+                        return self._emit(left)
             # last resort: only emit whole if it doesn't end with a hanging connective
             if not KO_CONNECTIVE_HANGING_RE.search(self.buf):
                 out = _norm(self.buf)
+                core = _rstrip_tail_punct(out)
+                if KO_SUSPECT_TAIL_RE.search(core):
+                    return None
                 if self._should_emit(out):
                     self.buf = ""
                     return self._emit(out)

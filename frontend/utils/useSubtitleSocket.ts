@@ -4,10 +4,16 @@ import { useEffect, useMemo, useRef, useState } from "react";
 type InterimKR = { type: "interim_kr"; text: string };
 type FinalKR   = { type: "final_kr";  text: string };
 type FastFinal = { type: "fast_final"; en: string; from?: string };
+type Translation = {
+  type: "translation";
+  payload?: string;
+  meta?: { translated?: string };
+};
 
 function isInterim(m: any): m is InterimKR { return m && m.type === "interim_kr" && typeof m.text === "string"; }
 function isFinalKR(m: any): m is FinalKR   { return m && m.type === "final_kr"  && typeof m.text === "string"; }
 function isFastFinal(m: any): m is FastFinal { return m && m.type === "fast_final" && typeof m.en === "string"; }
+function isTranslation(m: any): m is Translation { return m && m.type === "translation"; }
 
 type Options = {
   maxLines?: number;           // how many lines to keep on screen
@@ -107,6 +113,19 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
               setKrFinal(t);
               setKrInterim("");
               if (track === "kr" || track === "both") pushLine(setKrLines, t);
+              return;
+            }
+
+            if (isTranslation(msg)) {
+              const text =
+                (typeof msg.payload === "string" && msg.payload) ||
+                (typeof msg.meta?.translated === "string" && msg.meta.translated) ||
+                "";
+              const t = text.trim();
+              if (t) {
+                setEnFinal(t);
+                if (track === "en" || track === "both") pushLine(setEnLines, t);
+              }
               return;
             }
 

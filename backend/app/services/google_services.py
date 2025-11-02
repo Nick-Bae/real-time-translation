@@ -72,6 +72,40 @@ def _recognizer_path(recognizer_id: Optional[str] = None) -> str:
 def _glossary_id() -> str:
     return os.getenv("GOOGLE_TRANSLATE_GLOSSARY_ID", "")
 
+_LEADING_PUNCT_CHARS = set('"\'' "“”‘’([{〈《「『")
+_TRAILING_PUNCT_CHARS = set('"\'' "”’)]}〉》」』.,!?;:…‥·")
+
+
+def _split_affixes_for_glossary(text: str) -> tuple[str, str, str]:
+    if not text:
+        return ("", "", "")
+
+    leading_ws_len = len(text) - len(text.lstrip())
+    trailing_ws_len = len(text) - len(text.rstrip())
+
+    start = leading_ws_len
+    end = len(text) - trailing_ws_len
+    if end < start:
+        end = start
+
+    leading_ws = text[:start]
+    trailing_ws = text[end:]
+    core = text[start:end]
+
+    prefix_chars: list[str] = []
+    while core and core[0] in _LEADING_PUNCT_CHARS:
+        prefix_chars.append(core[0])
+        core = core[1:]
+
+    suffix_chars: list[str] = []
+    while core and core[-1] in _TRAILING_PUNCT_CHARS:
+        suffix_chars.append(core[-1])
+        core = core[:-1]
+
+    prefix = leading_ws + "".join(prefix_chars)
+    suffix = "".join(reversed(suffix_chars)) + trailing_ws
+    return prefix, core, suffix
+
 
 # =========================
 # Translate (v3)
@@ -88,10 +122,16 @@ def translate_text_generic(
     global _translate_client, _glossary_warned
     _translate_client = _translate_client or translate_v3.TranslationServiceClient()
 
+    prefix, stripped_text, suffix = _split_affixes_for_glossary(text)
+    content = stripped_text if stripped_text else text.strip()
+    if not content:
+        # text was only whitespace/punctuation; nothing to translate
+        return text
+
     parent = _parent_loc()  # projects/.../locations/us-central1 (or your region)
     req = {
         "parent": parent,
-        "contents": [text],
+        "contents": [content],
         "mime_type": "text/plain",
         "source_language_code": source_lang,
         "target_language_code": target_lang,
@@ -105,8 +145,10 @@ def translate_text_generic(
     try:
         resp = _translate_client.translate_text(request=req)
         if getattr(resp, "glossary_translations", None):
-            return resp.glossary_translations[0].translated_text
-        return resp.translations[0].translated_text
+            translated = resp.glossary_translations[0].translated_text
+        else:
+            translated = resp.translations[0].translated_text
+        return f"{prefix}{translated}{suffix}" if (prefix or suffix) else translated
     except (NotFound, InvalidArgument):
         if want_glossary and not _glossary_warned:
             logging.error("Translate glossary not available; falling back (glossary=%r parent=%r)", glossary, parent)
@@ -114,7 +156,8 @@ def translate_text_generic(
         # retry without glossary
         req.pop("glossary_config", None)
         resp = _translate_client.translate_text(request=req)
-        return resp.translations[0].translated_text
+        translated = resp.translations[0].translated_text
+        return f"{prefix}{translated}{suffix}" if (prefix or suffix) else translated
     
 def translate_kr_to_en(text: str, use_glossary: bool = True) -> str:
     """
@@ -127,10 +170,15 @@ def translate_kr_to_en(text: str, use_glossary: bool = True) -> str:
     global _translate_client, _glossary_warned
     _translate_client = _translate_client or translate_v3.TranslationServiceClient()
 
+    prefix, stripped_text, suffix = _split_affixes_for_glossary(text)
+    content = stripped_text if stripped_text else text.strip()
+    if not content:
+        return text
+
     parent = _parent_loc()  # e.g., projects/<id>/locations/us-central1
     req = {
         "parent": parent,
-        "contents": [text],
+        "contents": [content],
         "mime_type": "text/plain",
         "source_language_code": "ko",
         "target_language_code": "en",
@@ -146,8 +194,10 @@ def translate_kr_to_en(text: str, use_glossary: bool = True) -> str:
     try:
         resp = _translate_client.translate_text(request=req)
         if getattr(resp, "glossary_translations", None):
-            return resp.glossary_translations[0].translated_text
-        return resp.translations[0].translated_text
+            translated = resp.glossary_translations[0].translated_text
+        else:
+            translated = resp.translations[0].translated_text
+        return f"{prefix}{translated}{suffix}" if (prefix or suffix) else translated
 
     except (NotFound, InvalidArgument) as e:
         # Glossary missing / wrong location / invalid name → warn once and retry without glossary
@@ -161,7 +211,8 @@ def translate_kr_to_en(text: str, use_glossary: bool = True) -> str:
         try:
             req.pop("glossary_config", None)
             resp = _translate_client.translate_text(request=req)
-            return resp.translations[0].translated_text
+            translated = resp.translations[0].translated_text
+            return f"{prefix}{translated}{suffix}" if (prefix or suffix) else translated
         except Exception:
             # Re-raise original glossary error for clarity if fallback also fails
             raise

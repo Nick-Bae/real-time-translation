@@ -1,56 +1,75 @@
 # backend/app/utils/translate.py
-import os
-from dotenv import load_dotenv
+from __future__ import annotations
 
-# OpenAI >= 1.0
-from openai import AsyncOpenAI
+import asyncio
+from typing import Dict
 
-load_dotenv()
+from app.services.google_services import translate_text_generic
 
-_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # fast & good; use gpt-4o if you want
-_API_KEY = os.getenv("OPENAI_API_KEY")
+_LANG_ALIASES: Dict[str, str] = {
+    "korean": "ko",
+    "ko": "ko",
+    "ko-kr": "ko",
+    "english": "en",
+    "en": "en",
+    "en-us": "en",
+    "chinese": "zh",
+    "zh": "zh",
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW",
+    "mandarin": "zh",
+    "cantonese": "yue",
+    "spanish": "es",
+    "es": "es",
+    "japanese": "ja",
+    "ja": "ja",
+    "french": "fr",
+    "fr": "fr",
+    "vietnamese": "vi",
+    "vi": "vi",
+}
 
-_client: AsyncOpenAI | None = None
-
-def _get_client() -> AsyncOpenAI:
-    global _client
-    if _client is None:
-        if not _API_KEY:
-            raise RuntimeError("OPENAI_API_KEY not set")
-        _client = AsyncOpenAI(api_key=_API_KEY)
-    return _client
+def _normalize_lang_code(raw: str | None, fallback: str) -> str:
+    if not raw:
+        return fallback
+    value = raw.strip()
+    if not value:
+        return fallback
+    key = value.lower().replace("_", "-")
+    if key in _LANG_ALIASES:
+        return _LANG_ALIASES[key]
+    # Allow BCP-47 codes such as en-US. Google Translate v3 accepts them.
+    if "-" in key:
+        parts = [p for p in key.split("-") if p]
+        if not parts:
+            return fallback
+        primary = parts[0]
+        if len(primary) == 2 and primary.isalpha():
+            return "-".join([primary] + parts[1:])
+    if len(key) == 2 and key.isalpha():
+        return key
+    return fallback
 
 async def translate_text(text: str, source: str, target: str) -> str:
-    """
-    Async translator. Returns ONLY the translated text (no quotes/explanations).
-    On any API error, it fails open by returning the original text.
-    """
-    text = (text or "").strip()
-    if not text:
+    """Translate using Google Cloud. Fails open on unexpected errors."""
+    clean = (text or "").strip()
+    if not clean:
         return ""
 
-    client = _get_client()
+    src = _normalize_lang_code(source, "ko")
+    dst = _normalize_lang_code(target, "en")
 
-    system = (
-        f"You are a professional simultaneous interpreter. "
-        f"Translate faithfully from {source} to {target}. "
-        f"Do not explain, do not add quotes, do not add brackets—"
-        f"output ONLY the translation text."
-    )
+    loop = asyncio.get_running_loop()
+
+    def _translate_sync() -> str:
+        return translate_text_generic(
+            text=clean,
+            source_lang=src,
+            target_lang=dst,
+        )
 
     try:
-        resp = await client.chat.completions.create(
-            model=_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.2,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        # strip any accidental quotes
-        return out.strip('"\u201c\u201d')
+        return await loop.run_in_executor(None, _translate_sync)
     except Exception as e:
-        # Log and fail open (so the pipeline keeps moving)
-        print(f"[TX] OpenAI error: {e}")
-        return text
+        print(f"[TX] Google translate error: {e}")
+        return clean
