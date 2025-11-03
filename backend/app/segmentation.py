@@ -14,6 +14,13 @@ KO_ENDERS: Sequence[str] = (
     "합시다","합니까","거든요","거예요","거에요","더라고요"
 )
 
+KO_STICKY_SUFFIXES: Sequence[str] = ("함께", "같이")
+# Sentence endings like "…합시다" sometimes arrive sticky with the next word (e.g., "합시다함께").
+# Detect these so we can split right after the polite ending, even if whitespace slips in.
+KO_STICKY_SENT_BOUNDARY_RE = re.compile(
+    r"([가-힣]{2,}?다)(?=\s*(?:%s))" % "|".join(KO_STICKY_SUFFIXES)
+)
+
 # Put this near your other regexes (backend/app/segmentation.py)
 KO_TAIL_TOPIC_NP = re.compile(
     r"^(?:오늘|내일|어제|지금|그때|이제|다음|그리고|또|또한|한편|"
@@ -134,11 +141,22 @@ def _last_safe_split(s: str) -> Optional[int]:
         return None
     txt = s.rstrip()
 
+    # Sticky polite endings like "…다함께/다같이". If we see them, prefer splitting here
+    # before evaluating the full "ends with 다" check so we don't swallow the suffix.
+    sticky_k = None
+    for m in KO_STICKY_SENT_BOUNDARY_RE.finditer(txt):
+        idx = m.end(1)
+        if not sticky_k or idx > sticky_k:
+            sticky_k = idx
+    if sticky_k:
+        return sticky_k
+
     # full sentence ender (K polite/plain endings OR end punctuation)
     if KO_SENT_END_PUNCT_RE.search(txt) or _ends_with_ko_ender(txt):
         return len(txt)
 
     last_k = None
+
     for m in KO_CONNECTIVE_BOUNDARY_RE.finditer(txt):
         k = m.end()
         # pull in immediate trailing punctuation (.,，。 etc.) if it exists
@@ -153,7 +171,8 @@ def _last_safe_split(s: str) -> Optional[int]:
         rest = txt[j:].lstrip()
         if KO_CONNECTIVE_HANGING_RE.search(base) and not rest:
             continue
-        last_k = j
+        if not last_k or j > last_k:
+            last_k = j
     return last_k
 
 

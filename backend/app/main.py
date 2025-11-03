@@ -447,11 +447,49 @@ async def ws_translate(ws: WebSocket):
             if not committed_prefix:
                 return f
             prefix = _norm(committed_prefix)
-            if prefix and f.startswith(prefix):
-                return _norm(f[len(prefix):])
-            core_prefix = prefix.rstrip(" .,!?:;…‥、。！？」］)}]“”‘’'\"")
-            if core_prefix and f.startswith(core_prefix):
-                return _norm(f[len(core_prefix):])
+            if not prefix:
+                return f
+
+            trail_chars = " .,!?:;…‥、。！？」］)}]“”‘’'\""
+            core_prefix = prefix.rstrip(trail_chars)
+
+            def _strip_front(container: str, piece: str) -> str | None:
+                if piece and container.startswith(piece):
+                    return container[len(piece):].lstrip()
+                return None
+
+            def _strip_back(container: str, piece: str) -> str | None:
+                if piece and container.endswith(piece):
+                    return container[: len(container) - len(piece)].rstrip()
+                return None
+
+            def _strip_first_occurrence(container: str, piece: str) -> str | None:
+                if not piece:
+                    return None
+                idx = container.find(piece)
+                if idx < 0:
+                    return None
+                left = container[:idx].strip()
+                right = container[idx + len(piece):].strip()
+                if left and right:
+                    return f"{left} {right}"
+                return left or right or ""
+
+            for candidate in (prefix, core_prefix):
+                stripped = _strip_front(f, candidate)
+                if stripped is not None:
+                    return _norm(stripped)
+
+            for candidate in (prefix, core_prefix):
+                stripped = _strip_back(f, candidate)
+                if stripped is not None:
+                    return _norm(stripped)
+
+            for candidate in (prefix, core_prefix):
+                stripped = _strip_first_occurrence(f, candidate)
+                if stripped is not None:
+                    return _norm(stripped)
+
             return f
 
         def _norm(s: str) -> str:

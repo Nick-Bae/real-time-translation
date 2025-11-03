@@ -207,6 +207,18 @@ export default function Live() {
               // setEn is handled elsewhere by fast_final or commit.
               // (Do nothing here.)
             } else {
+              const tailKey = koKey(tailKo);
+              const tailCore = tailKo.replace(/[\s.,!?…‥·、，"'”’]+$/g, "");
+              const endsWithDa = tailCore.endsWith("다");
+              const prevCommitKey = lastKoKeyRef.current || "";
+              const tailContainsCommit = prevCommitKey ? tailKey.includes(prevCommitKey) : false;
+
+              // Skip translating tails that don't finish with the "…다" ending or simply repeat
+              // the committed clause (prevents duplicate EN playback like "다함께" cases).
+              if (!endsWithDa || tailContainsCommit) {
+                return;
+              }
+
               try {
                 const srcCode = LANGS[srcIdx].tr;
                 const dstCode = LANGS[dstIdx].tr;
