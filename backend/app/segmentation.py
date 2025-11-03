@@ -21,6 +21,12 @@ KO_STICKY_SENT_BOUNDARY_RE = re.compile(
     r"([가-힣]{2,}?다)(?=\s*(?:%s))" % "|".join(KO_STICKY_SUFFIXES)
 )
 
+_KO_ENDERS_SORTED = sorted(KO_ENDERS, key=len, reverse=True)
+_KO_ENDER_PATTERN = "|".join(re.escape(end) for end in _KO_ENDERS_SORTED)
+KO_INNER_ENDER_RE = re.compile(
+    rf"([가-힣]{{2,}}(?:{_KO_ENDER_PATTERN}))(?=\s+[\"'“”‘’]*[가-힣A-Za-z0-9])"
+)
+
 # Put this near your other regexes (backend/app/segmentation.py)
 KO_TAIL_TOPIC_NP = re.compile(
     r"^(?:오늘|내일|어제|지금|그때|이제|다음|그리고|또|또한|한편|"
@@ -141,21 +147,33 @@ def _last_safe_split(s: str) -> Optional[int]:
         return None
     txt = s.rstrip()
 
+    last_k: Optional[int] = None
+
+    def _push(idx: int):
+        nonlocal last_k
+        if idx and (last_k is None or idx > last_k):
+            last_k = idx
+
     # Sticky polite endings like "…다함께/다같이". If we see them, prefer splitting here
-    # before evaluating the full "ends with 다" check so we don't swallow the suffix.
-    sticky_k = None
     for m in KO_STICKY_SENT_BOUNDARY_RE.finditer(txt):
         idx = m.end(1)
-        if not sticky_k or idx > sticky_k:
-            sticky_k = idx
-    if sticky_k:
-        return sticky_k
+        rest = txt[idx:]
+        if rest.strip():
+            _push(idx)
 
-    # full sentence ender (K polite/plain endings OR end punctuation)
-    if KO_SENT_END_PUNCT_RE.search(txt) or _ends_with_ko_ender(txt):
-        return len(txt)
+    # Sentence punctuation (., !, ?, …) followed by more text → safe boundary before next clause
+    for i, ch in enumerate(txt):
+        if ch in "．.。!?…‥":
+            rest = txt[i + 1 :]
+            if rest.strip():
+                _push(i + 1)
 
-    last_k = None
+    # Plain sentence endings (…다/…습니다/…) immediately followed by another word without punctuation
+    for m in KO_INNER_ENDER_RE.finditer(txt):
+        idx = m.end(1)
+        rest = txt[idx:]
+        if rest.strip():
+            _push(idx)
 
     for m in KO_CONNECTIVE_BOUNDARY_RE.finditer(txt):
         k = m.end()
@@ -171,9 +189,17 @@ def _last_safe_split(s: str) -> Optional[int]:
         rest = txt[j:].lstrip()
         if KO_CONNECTIVE_HANGING_RE.search(base) and not rest:
             continue
-        if not last_k or j > last_k:
-            last_k = j
-    return last_k
+        if rest.strip():
+            _push(j)
+
+    if last_k is not None:
+        return last_k
+
+    # full sentence ender (K polite/plain endings OR end punctuation) → emit entire buffer
+    if KO_SENT_END_PUNCT_RE.search(txt) or _ends_with_ko_ender(txt):
+        return len(txt)
+
+    return None
 
 
 # ----- Config -----------------------------------------------------------------

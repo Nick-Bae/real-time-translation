@@ -50,3 +50,17 @@ def test_clause_committer_handles_sticky_da_followed_by_common_adverbs():
     assert emitted3 == "오늘 말씀을 증언합시다"
     remainder3 = committer.force_flush()
     assert remainder3 == "같이 나아갑시다"
+
+
+def test_clause_committer_detects_sentences_without_pause():
+    committer = ClauseCommitter(CommitConfig())
+    text = (
+        "이것이 하나님의 주권입니다. 인간은 실패해도 하나님은 여전히 자신의 계획을 완성하십니다."
+    )
+    emitted = committer.feed(text)
+    assert emitted == "이것이 하나님의 주권입니다."
+
+    remainder = committer.force_flush()
+    assert remainder == (
+        "인간은 실패해도 하나님은 여전히 자신의 계획을 완성하십니다."
+    )
