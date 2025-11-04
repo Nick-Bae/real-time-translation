@@ -1,8 +1,24 @@
 // pages/display.tsx
 "use client";
+import { useEffect, useState, type CSSProperties } from "react";
 import { useSubtitleSocket } from "../utils/useSubtitleSocket";
 
+const OVERLAY_TOGGLE_KEY = "b";
+
 export default function Display() {
+  const [overlayMode, setOverlayMode] = useState(true);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() === OVERLAY_TOGGLE_KEY) {
+        setOverlayMode((prev) => !prev);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
   const {
     connected,
     // krInterim,    if you want to show a faint preview
@@ -16,6 +32,63 @@ export default function Display() {
   );
 
   const lastKr = krLines[krLines.length - 1] || "";
+
+  const containerStyle: CSSProperties = {
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "flex-end",
+    alignItems: "stretch",
+    color: "#fff",
+    padding: "2.6rem 5vw 2rem",
+    boxSizing: "border-box",
+    overflow: "hidden",
+    fontFamily:
+      "system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif",
+    transition: "background-color 180ms ease, padding 180ms ease",
+  };
+
+  if (overlayMode) {
+    Object.assign(containerStyle, {
+      position: "fixed",
+      inset: 0,
+      width: "100vw",
+      minHeight: "100vh",
+      backgroundColor: "transparent",
+      pointerEvents: "none",
+      zIndex: 2147483646,
+      padding: "2.4rem 6vw 1.8rem",
+    });
+  } else {
+    Object.assign(containerStyle, {
+      position: "relative",
+      width: "100%",
+      minHeight: "100vh",
+      backgroundColor: "#000",
+      pointerEvents: "auto",
+    });
+  }
+
+  const captionSurfaceStyle: CSSProperties = {
+    maxWidth: "min(960px, 96vw)",
+    width: "100%",
+    margin: "0 auto",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "flex-end",
+    gap: "1em",
+    textAlign: "left",
+    transition: "background-color 180ms ease, backdrop-filter 180ms ease, box-shadow 180ms ease",
+  };
+
+  if (overlayMode) {
+    Object.assign(captionSurfaceStyle, {
+      backgroundColor: "rgba(0, 0, 0, 0.65)",
+      backdropFilter: "blur(8px)",
+      borderRadius: "1.2rem",
+      padding: "1.2rem 1.6rem",
+      boxShadow: "0 18px 48px rgba(0, 0, 0, 0.4)",
+    });
+  }
 
   return (
     <div

@@ -1,7 +1,7 @@
 // frontend/pages/live.tsx
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { startMicStream } from "../lib/useMicTranslate";
 import { useAudioQueue } from "../lib/useAudioQueue";
 import { API_URL, WS_URL } from "../utils/urls";
@@ -68,10 +68,14 @@ export default function Live() {
   const spokenSeqsRef = useRef<Set<number>>(new Set());
   const pendingCommitTimersRef = useRef<Map<string, number>>(new Map());
 
+  const utteranceSegmentCountRef = useRef(0);
+  const finalTranslateAbortRef = useRef<AbortController | null>(null);
+
   const KO_WINDOW_MS = 5000; // treat EN updates for the same KO within 5s as the same clause
 
 
   const DEDUP_WINDOW_MS = 4000; // ignore exact duplicates within 4s
+
 
   function normKo(s: string) {
     return (s || "").replace(/\s+/g, " ").trim();
@@ -146,9 +150,112 @@ export default function Live() {
     return () => {
       pendingCommitTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
       pendingCommitTimersRef.current.clear();
+      if (finalTranslateAbortRef.current) {
+        finalTranslateAbortRef.current.abort();
+        finalTranslateAbortRef.current = null;
+      }
     };
   }, []);
 
+  const translateFinalKo = useCallback(
+    async (fullKo: string) => {
+      const normalized = normKo(fullKo);
+      if (!normalized) return;
+      const key = koKey(normalized);
+
+      const existing = enByKoRef.current.get(key);
+      const existingEn = existing?.en ? normEn(existing.en) : "";
+      if (existingEn) {
+        setEn(existingEn);
+        setSegments((prev) => {
+          if (!prev.length) {
+            return [existingEn];
+          }
+          const total = prev.length;
+          const activeCount = Math.min(
+            Math.max(utteranceSegmentCountRef.current, 0),
+            total
+          );
+          const replaceCount = activeCount > 0 ? activeCount : 0;
+          const base =
+            replaceCount > 0 ? prev.slice(0, total - replaceCount) : prev.slice();
+          if (base.length && normEn(base[base.length - 1]) === existingEn) {
+            return base;
+          }
+          return [...base, existingEn];
+        });
+        utteranceSegmentCountRef.current = 0;
+        const stamp = Date.now();
+        enByKoRef.current.set(key, {
+          en: existingEn,
+          spoken: existing?.spoken ?? true,
+          ts: stamp,
+        });
+        recentEnPlayedRef.current.set(existingEn, stamp);
+        lastKoKeyRef.current = key;
+        return;
+      }
+
+      if (finalTranslateAbortRef.current) {
+        finalTranslateAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      finalTranslateAbortRef.current = controller;
+      try {
+        const res = await fetch(`${API}/api/translate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: normalized,
+            src: LANGS[srcIdx].tr,
+            dst: LANGS[dstIdx].tr,
+          }),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`translate ${res.status} ${res.statusText}`);
+        const json = await res.json().catch(() => ({} as any));
+        const finalEnRaw =
+          (typeof json?.text === "string" && json.text) ||
+          (typeof json?.translated === "string" && json.translated) ||
+          (typeof json?.en === "string" && json.en) ||
+          "";
+        const finalEn = normEn(finalEnRaw);
+        if (!finalEn) return;
+
+        setEn(finalEn);
+        setSegments((prev) => {
+          if (!prev.length) {
+            return [finalEn];
+          }
+          const total = prev.length;
+          const activeCount = Math.min(
+            Math.max(utteranceSegmentCountRef.current, 0),
+            total
+          );
+          const replaceCount = activeCount > 0 ? activeCount : 0;
+          const base =
+            replaceCount > 0 ? prev.slice(0, total - replaceCount) : prev.slice();
+          if (base.length && normEn(base[base.length - 1]) === finalEn) {
+            return base;
+          }
+          return [...base, finalEn];
+        });
+        utteranceSegmentCountRef.current = 0;
+        const timestamp = Date.now();
+        recentEnPlayedRef.current.set(finalEn, timestamp);
+        enByKoRef.current.set(key, { en: finalEn, spoken: true, ts: timestamp });
+        lastKoKeyRef.current = key;
+      } catch (err) {
+        if ((err as any)?.name === "AbortError") return;
+        console.error("[final_kr translate]", err);
+      } finally {
+        if (finalTranslateAbortRef.current === controller) {
+          finalTranslateAbortRef.current = null;
+        }
+      }
+    },
+    [API, dstIdx, srcIdx]
+  );
 
   function errorMessage(err: unknown): string {
     if (err instanceof Error) return err.message;
@@ -181,6 +288,12 @@ export default function Live() {
       setEn("");
       setKrInterim("");
       setKrFinal("");
+      utteranceSegmentCountRef.current = 0;
+      if (finalTranslateAbortRef.current) {
+        finalTranslateAbortRef.current.abort();
+        finalTranslateAbortRef.current = null;
+      }
+      lastKoKeyRef.current = null;
 
       await ctlRef.current?.stop?.().catch(() => { });
       ctlRef.current = null;
@@ -196,72 +309,72 @@ export default function Live() {
             const tailKo = normKo((m as any).text || "");
             setKrFinal(tailKo);
 
-            // If we had an early clause commit for this utterance,
-            // speak ONLY the tail (suffix) on final_kr.
             const now = Date.now();
             const hadRecentCommit = now - (lastCommitAtRef.current || 0) < KO_WINDOW_MS;
-            if (!hadRecentCommit || !tailKo) {
-              // No early commit → the upcoming fast_final (if any) will handle TTS.
-              // Or empty tail.
-              // Just update UI and return.
-              // setEn is handled elsewhere by fast_final or commit.
-              // (Do nothing here.)
-            } else {
+            if (hadRecentCommit && tailKo) {
               const tailKey = koKey(tailKo);
               const tailCore = tailKo.replace(/[\s.,!?…‥·、，"'”’]+$/g, "");
               const endsWithDa = tailCore.endsWith("다");
               const prevCommitKey = lastKoKeyRef.current || "";
               const tailContainsCommit = prevCommitKey ? tailKey.includes(prevCommitKey) : false;
 
-              // Skip translating tails that don't finish with the "…다" ending or simply repeat
-              // the committed clause (prevents duplicate EN playback like "다함께" cases).
-              if (!endsWithDa || tailContainsCommit) {
-                return;
-              }
+              if (endsWithDa && !tailContainsCommit) {
+                try {
+                  const srcCode = LANGS[srcIdx].tr;
+                  const dstCode = LANGS[dstIdx].tr;
+                  const trRes = await fetch(`${API}/api/translate`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: tailKo, src: srcCode, dst: dstCode }),
+                  });
+                  if (!trRes.ok) throw new Error(`translate ${trRes.status} ${trRes.statusText}`);
+                  const trJson = await trRes.json().catch(() => ({} as any));
+                  const enText =
+                    (typeof trJson?.text === "string" && trJson.text) ||
+                    (typeof trJson?.translated === "string" && trJson.translated) ||
+                    (typeof trJson?.en === "string" && trJson.en) ||
+                    "";
+                  const enNorm = normEn(enText);
+                  if (enNorm) {
+                    setEn(enNorm);
+                    setSegments((prev) => {
+                      if (!prev.length) {
+                        utteranceSegmentCountRef.current = 1;
+                        return [enNorm];
+                      }
+                      if (utteranceSegmentCountRef.current === 0) {
+                        utteranceSegmentCountRef.current = 1;
+                        return [...prev, enNorm];
+                      }
+                      const last = prev[prev.length - 1];
+                      if (normEn(last) === enNorm) {
+                        return prev;
+                      }
+                      utteranceSegmentCountRef.current += 1;
+                      return [...prev, enNorm];
+                    });
 
-              try {
-                const srcCode = LANGS[srcIdx].tr;
-                const dstCode = LANGS[dstIdx].tr;
-                const trRes = await fetch(`${API}/api/translate`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ text: tailKo, src: srcCode, dst: dstCode }),
-                });
-                if (!trRes.ok) throw new Error(`translate ${trRes.status} ${trRes.statusText}`);
-                const trJson = await trRes.json().catch(() => ({} as any));
-                const enText =
-                  (typeof trJson?.text === "string" && trJson.text) ||
-                  (typeof trJson?.translated === "string" && trJson.translated) ||
-                  (typeof trJson?.en === "string" && trJson.en) ||
-                  "";
-                const enNorm = normEn(enText);
-                if (!enNorm) return;
-
-                // Update UI as a new segment (suffix)
-                setEn(enNorm);
-                setSegments((prev) => {
-                  if (!prev.length) return [enNorm];
-                  return [...prev, enNorm];
-                });
-
-                // Dedup: avoid replaying the same EN within a short window
-                if (seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) return;
-
-                const ttsRes = await fetch(`${API}/api/tts`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    text: enNorm,
-                    voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
-                  }),
-                });
-                if (!ttsRes.ok) throw new Error(`TTS ${ttsRes.status} ${ttsRes.statusText}`);
-                const ab = await ttsRes.arrayBuffer();
-                if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
-              } catch (err) {
-                console.error("[final_kr suffix TTS]", err);
+                    if (!seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
+                      const ttsRes = await fetch(`${API}/api/tts`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          text: enNorm,
+                          voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+                        }),
+                      });
+                      if (!ttsRes.ok) throw new Error(`TTS ${ttsRes.status} ${ttsRes.statusText}`);
+                      const ab = await ttsRes.arrayBuffer();
+                      if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
+                    }
+                  }
+                } catch (err) {
+                  console.error("[final_kr suffix TTS]", err);
+                }
               }
             }
+
+            void translateFinalKo(tailKo);
           }
 
           // Prevent fast_final from stomping on a fresh commit
@@ -277,8 +390,15 @@ export default function Live() {
 
             // Always update UI (treat as preview/refinement in the last line)
             setEn(en);
-            setSegments(prev => {
-              if (!prev.length) return [en];
+            setSegments((prev) => {
+              if (utteranceSegmentCountRef.current === 0) {
+                utteranceSegmentCountRef.current = 1;
+                return [...prev, en];
+              }
+              if (!prev.length) {
+                utteranceSegmentCountRef.current = 1;
+                return [en];
+              }
               const copy = prev.slice();
               copy[copy.length - 1] = en;
               return copy;
@@ -404,24 +524,47 @@ export default function Live() {
               // --- replace vs append
               setEn(enNorm);
               setSegments((prev) => {
-                if (!prev.length) return [enNorm];
+                if (!prev.length) {
+                  utteranceSegmentCountRef.current = 1;
+                  return [enNorm];
+                }
                 if (isReplace || existingEntry) {
+                  if (utteranceSegmentCountRef.current === 0) {
+                    utteranceSegmentCountRef.current = 1;
+                  }
                   const copy = prev.slice();
                   copy[copy.length - 1] = enNorm; // refine/replace
                   return copy;
                 }
-                if (normEn(prev[prev.length - 1]) === enNorm) return prev; // exact duplicate
+                if (utteranceSegmentCountRef.current === 0) {
+                  utteranceSegmentCountRef.current = 1;
+                  return [...prev, enNorm];
+                }
+                if (normEn(prev[prev.length - 1]) === enNorm) {
+                  return prev; // exact duplicate
+                }
+                utteranceSegmentCountRef.current += 1;
                 return [...prev, enNorm]; // new clause
               });
 
               const nowTs = Date.now();
+              for (const [text, ts] of recentEnPlayedRef.current) {
+                if (nowTs - ts > DEDUP_WINDOW_MS) {
+                  recentEnPlayedRef.current.delete(text);
+                }
+              }
               const prevEn = existingEntry?.en ? normEn(existingEntry.en) : "";
               const enChanged = prevEn !== enNorm;
               const wasSpoken = existingEntry?.spoken ?? false;
 
               let shouldSpeak = enChanged || !wasSpoken;
-              if (!enChanged && seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
-                console.log("[COMMIT] dedup EN (skip TTS)", enNorm);
+              const lastSpokenAt = recentEnPlayedRef.current.get(enNorm);
+              if (
+                shouldSpeak &&
+                lastSpokenAt !== undefined &&
+                nowTs - lastSpokenAt < DEDUP_WINDOW_MS
+              ) {
+                console.log("[COMMIT] dedup EN (skip TTS window)", enNorm);
                 shouldSpeak = false;
               }
 
@@ -469,14 +612,28 @@ export default function Live() {
 
             setEn(enNorm);
             setSegments((prev) => {
-              if (!prev.length) return [enNorm];
+              if (!prev.length) {
+                utteranceSegmentCountRef.current = 1;
+                return [enNorm];
+              }
               if (existing) {
+                if (utteranceSegmentCountRef.current === 0) {
+                  utteranceSegmentCountRef.current = 1;
+                }
                 const copy = prev.slice();
                 copy[copy.length - 1] = enNorm;
                 return copy;
               }
+              if (utteranceSegmentCountRef.current === 0) {
+                utteranceSegmentCountRef.current = 1;
+                if (normEn(prev[prev.length - 1]) === enNorm) {
+                  return prev;
+                }
+                return [...prev, enNorm];
+              }
               const last = prev[prev.length - 1];
               if (normEn(last) === enNorm) return prev;
+              utteranceSegmentCountRef.current += 1;
               return [...prev, enNorm];
             });
 
@@ -595,6 +752,12 @@ export default function Live() {
                 onClick={() => {
                   clear();
                   setSegments([]);
+                  utteranceSegmentCountRef.current = 0;
+                  if (finalTranslateAbortRef.current) {
+                    finalTranslateAbortRef.current.abort();
+                    finalTranslateAbortRef.current = null;
+                  }
+                  lastKoKeyRef.current = null;
                 }}
                 className="rounded-xl bg-gray-200 px-4 py-2 text-gray-900 shadow hover:bg-gray-300 active:bg-gray-400"
               >
