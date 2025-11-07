@@ -11,6 +11,7 @@ from typing import Deque, Iterable, Optional
 from collections import deque
 import google.auth
 from google.oauth2 import service_account
+from google.api_core import exceptions as gcloud_exceptions
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request, HTTPException, Body, Response
@@ -377,6 +378,21 @@ async def ws_translate(ws: WebSocket):
                     ):
                         asyncio.run_coroutine_threadsafe(stt_out.put(msg), loop)
                     break  # normal end
+                except gcloud_exceptions.Aborted as e:
+                    emsg = str(e)
+                    if "Max duration of 5 minutes" in emsg:
+                        logger.info("STT window rolled (5 min cap); restarting")
+                        attempts = 0
+                        time.sleep(0.2)
+                        continue
+                    logger.error("STT aborted: %s", emsg)
+                    if closed:
+                        break
+                    attempts += 1
+                    delay = min(max_delay, min_delay * (2 ** (attempts - 1)))
+                    logger.warning("Restarting STT window in %.1fs (attempt %d)", delay, attempts)
+                    time.sleep(delay)
+                    continue
                 except Exception as e:
                     emsg = str(e)
                     logger.error("STT window error: %s", emsg)
