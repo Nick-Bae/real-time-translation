@@ -905,7 +905,6 @@ async def ws_translate(ws: WebSocket):
                     break
 
                 elif t == "__stt_rollover__":
-                    mark_voice_activity()
                     # Utterance boundary; flush remainder
                     flushed = committer.force_flush()
                     if flushed:
@@ -942,7 +941,6 @@ async def ws_translate(ws: WebSocket):
 
 
                 elif t == "__speech_activity_end__":
-                    mark_voice_activity()
                     # end of speech → flush immediately (but do NOT reset utterance state here)
                     flushed = committer.force_flush()
                     if flushed:
