@@ -116,64 +116,54 @@ def _looks_like_tail_marker(tail_head: str, *, lang: str = "ko") -> int:
                     return len(mk)
     return 0
 
-def _last_safe_split(s: str) -> Optional[int]:
+def _safe_split_points(s: str) -> list[int]:
+    """Return ascending character indexes where it's safe to split before another clause."""
     if not s:
-        return None
+        return []
     txt = s.rstrip()
+    if not txt:
+        return []
 
-    last_k: Optional[int] = None
+    points: set[int] = set()
 
-    def _push(idx: int):
-        nonlocal last_k
-        if idx and (last_k is None or idx > last_k):
-            last_k = idx
+    def _try_push(idx: int, rest: str):
+        if idx <= 0:
+            return
+        if not rest or not rest.strip():
+            return
+        points.add(idx)
 
-    # Sticky polite endings like "…다함께/다같이". If we see them, prefer splitting here
+    # Sticky polite endings like "…다함께/다같이" → split right after the polite ending
     for m in KO_STICKY_SENT_BOUNDARY_RE.finditer(txt):
         idx = m.end(1)
-        rest = txt[idx:]
-        if rest.strip():
-            _push(idx)
+        _try_push(idx, txt[idx:])
 
-    # Sentence punctuation (., !, ?, …) followed by more text → safe boundary before next clause
+    # Sentence punctuation (., !, ?, …) followed by more text → safe boundary
     for i, ch in enumerate(txt):
         if ch in "．.。!?…‥":
             rest = txt[i + 1 :]
-            if rest.strip():
-                _push(i + 1)
+            _try_push(i + 1, rest)
 
     # Plain sentence endings (…다/…습니다/…) immediately followed by another word without punctuation
     for m in KO_INNER_ENDER_RE.finditer(txt):
         idx = m.end(1)
-        rest = txt[idx:]
-        if rest.strip():
-            _push(idx)
+        _try_push(idx, txt[idx:])
 
+    # Connective boundaries such as "…, 그런데 …" (only if the right side has content)
     for m in KO_CONNECTIVE_BOUNDARY_RE.finditer(txt):
         k = m.end()
-        # pull in immediate trailing punctuation (.,，。 etc.) if it exists
         j = k
         while j < len(txt) and txt[j] in " ,．。!?…‥":
-            # only swallow one punctuation token; stop before next word
             j += 1
             break
-        # ignore if still hanging
         snippet = txt[:j]
         base = _rstrip_tail_punct(snippet)
         rest = txt[j:].lstrip()
         if KO_CONNECTIVE_HANGING_RE.search(base) and not rest:
             continue
-        if rest.strip():
-            _push(j)
+        _try_push(j, rest)
 
-    if last_k is not None:
-        return last_k
-
-    # full sentence ender (K polite/plain endings OR end punctuation) → emit entire buffer
-    if KO_SENT_END_PUNCT_RE.search(txt) or _ends_with_ko_ender(txt):
-        return len(txt)
-
-    return None
+    return sorted(points)
 
 
 # ----- Config -----------------------------------------------------------------
@@ -304,22 +294,23 @@ class ClauseCommitter:
         # keep latest snapshot
         self.buf = inc
 
-        # 2) Connective/safe boundary early commit
+        # 2) Connective/safe boundary early commit (emit earliest viable sentence)
         if not self.lang.startswith("en"):
-            k = _last_safe_split(self.buf)
-            if k and k > self.last_left_len:
+            for k in _safe_split_points(self.buf):
                 buf_snapshot = self.buf
                 left = buf_snapshot[:k].rstrip()
+                if len(_norm(left)) <= self.last_left_len:
+                    continue
                 right = buf_snapshot[k:].lstrip()
-                if len(_norm(left)) >= 6 and self._should_emit(left):
-                    left_core = _rstrip_tail_punct(left)
-                    if KO_SUSPECT_TAIL_RE.search(left_core):
-                        self.buf = buf_snapshot
-                    elif not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
-                        self.buf = buf_snapshot
-                    else:
-                        self.buf = right
-                        return self._emit(left)
+                if len(_norm(left)) < 6 or not self._should_emit(left):
+                    continue
+                left_core = _rstrip_tail_punct(left)
+                if KO_SUSPECT_TAIL_RE.search(left_core):
+                    continue
+                if not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
+                    continue
+                self.buf = right
+                return self._emit(left)
 
         # 3) Full sentence enders
         if self.cfg.commit_on_tail_ender and self._is_tail_ender(self.buf):
@@ -344,17 +335,18 @@ class ClauseCommitter:
         # 5) Whole-guard (time/length), try a safe split first; avoid hanging connective
         elapsed = time.time() - self.last_commit_at
         if len(_norm(self.buf)) >= self.cfg.max_chars or elapsed >= self.cfg.max_elapsed_s:
-            k = _last_safe_split(self.buf)
-            if k and k > self.last_left_len:
+            for k in _safe_split_points(self.buf):
                 left = self.buf[:k].rstrip()
+                if len(_norm(left)) <= self.last_left_len:
+                    continue
                 right = self.buf[k:].lstrip()
-                if len(_norm(left)) >= 6 and self._should_emit(left):
-                    left_core = _rstrip_tail_punct(left)
-                    if KO_SUSPECT_TAIL_RE.search(left_core):
-                        pass
-                    else:
-                        self.buf = right
-                        return self._emit(left)
+                if len(_norm(left)) < 6 or not self._should_emit(left):
+                    continue
+                left_core = _rstrip_tail_punct(left)
+                if KO_SUSPECT_TAIL_RE.search(left_core):
+                    continue
+                self.buf = right
+                return self._emit(left)
             # last resort: only emit whole if it doesn't end with a hanging connective
             if not KO_CONNECTIVE_HANGING_RE.search(self.buf):
                 out = _norm(self.buf)

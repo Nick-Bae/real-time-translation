@@ -413,6 +413,7 @@ async def ws_translate(ws: WebSocket):
         MIN_COMMIT_TOKENS = 2
         MIN_COMMIT_CHARS  = 10
         DEDUP_WINDOW_S    = 4.0
+        SILENCE_FLUSH_S   = 3.0  # stop/flush if no voice activity for this long
 
         # connective tails we should NOT emit alone
         # Replace your old CONNECTIVE_TAIL with this:
@@ -784,6 +785,15 @@ async def ws_translate(ws: WebSocket):
             if CONNECTIVE_TAIL.search(strip_trail_punct(txt)):
                 return
 
+            # If a snapshot is already pending and this one strictly extends it,
+            # flush the older chunk immediately so it isn't overwritten.
+            if pending_commit and txt.startswith(pending_commit) and len(txt) > len(pending_commit):
+                if commit_task and not commit_task.done():
+                    commit_task.cancel()
+                prev = pending_commit
+                pending_commit = None
+                await send_commit_now(ws, manager, dst_tr, prev)
+
             # Coalesce: replace any pending commit with the latest snapshot
             snap = txt
             pending_commit = snap
@@ -816,7 +826,48 @@ async def ws_translate(ws: WebSocket):
             if snap:
                 await send_commit_now(ws, manager, dst_tr, snap)
 
+        last_voice_event = time.time()
+
+        def mark_voice_activity():
+            nonlocal last_voice_event
+            last_voice_event = time.time()
+
+        async def silence_watchdog():
+            nonlocal pending_interim, ko_committed_prefix, commit_used, sent_fast_final
+            nonlocal recent_commit_text, recent_commit_time
+            try:
+                while True:
+                    await asyncio.sleep(max(0.2, SILENCE_FLUSH_S / 2))
+                    if time.time() - last_voice_event < SILENCE_FLUSH_S:
+                        continue
+                    has_pending = bool(pending_commit and pending_commit.strip())
+                    has_buffer = bool(committer.buf.strip())
+                    if not (has_pending or has_buffer):
+                        continue
+
+                    await flush_pending_commit()
+                    flushed = committer.force_flush()
+                    if flushed:
+                        await send_commit_now(ws, manager, dst_tr, flushed)
+
+                    pending_interim = None
+                    ko_committed_prefix = ""
+                    commit_used = False
+                    sent_fast_final = False
+                    recent_commit_text = ""
+                    recent_commit_time = 0.0
+                    try:
+                        committer.reset_for_new_utterance()
+                    except AttributeError:
+                        pass
+                    mark_voice_activity()
+            except asyncio.CancelledError:
+                pass
+
+        silence_task: Optional[asyncio.Task] = None
+
         try:
+            silence_task = asyncio.create_task(silence_watchdog())
             while True:
                 msg = await stt_out.get()
                 t = msg.get("type")
@@ -843,6 +894,7 @@ async def ws_translate(ws: WebSocket):
                     break
 
                 elif t == "__stt_rollover__":
+                    mark_voice_activity()
                     # Utterance boundary; flush remainder
                     flushed = committer.force_flush()
                     if flushed:
@@ -879,6 +931,7 @@ async def ws_translate(ws: WebSocket):
 
 
                 elif t == "__speech_activity_end__":
+                    mark_voice_activity()
                     # end of speech → flush immediately (but do NOT reset utterance state here)
                     flushed = committer.force_flush()
                     if flushed:
@@ -888,6 +941,7 @@ async def ws_translate(ws: WebSocket):
                         await flush_pending_commit()
 
                 elif t == "interim":
+                    mark_voice_activity()
                     pending_interim = msg.get("text", "") or ""
                     # mirror interim
                     payload = {"type": "interim_kr", "text": pending_interim}
@@ -901,6 +955,7 @@ async def ws_translate(ws: WebSocket):
                     continue
 
                 elif t == "final":
+                    mark_voice_activity()
                     src_text = (msg.get("text") or "").strip()
 
                     # flush remainder first
@@ -961,6 +1016,12 @@ async def ws_translate(ws: WebSocket):
             await flush_pending_commit()
             if commit_tasks:
                 await asyncio.gather(*commit_tasks, return_exceptions=True)
+            if silence_task is not None:
+                try:
+                    silence_task.cancel()
+                    await silence_task
+                except Exception:
+                    pass
             logger.info("STT supervisor finished")
 
 
