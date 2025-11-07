@@ -397,7 +397,7 @@ async def ws_translate(ws: WebSocket):
     worker.start()
 
     async def stt_consumer():
-        nonlocal seq
+        nonlocal seq, closed
         logger.info("STT supervisor started")
 
 
@@ -413,7 +413,8 @@ async def ws_translate(ws: WebSocket):
         MIN_COMMIT_TOKENS = 2
         MIN_COMMIT_CHARS  = 10
         DEDUP_WINDOW_S    = 4.0
-        SILENCE_FLUSH_S   = 3.0  # stop/flush if no voice activity for this long
+        SILENCE_FLUSH_S   = 3.0  # flush buffer after short silence
+        IDLE_TIMEOUT_S    = 12.0 # fully stop session after extended silence
 
         # connective tails we should NOT emit alone
         # Replace your old CONNECTIVE_TAIL with this:
@@ -834,15 +835,12 @@ async def ws_translate(ws: WebSocket):
 
         async def silence_watchdog():
             nonlocal pending_interim, ko_committed_prefix, commit_used, sent_fast_final
-            nonlocal recent_commit_text, recent_commit_time
+            nonlocal recent_commit_text, recent_commit_time, closed
             try:
                 while True:
-                    await asyncio.sleep(max(0.2, SILENCE_FLUSH_S / 2))
-                    if time.time() - last_voice_event < SILENCE_FLUSH_S:
-                        continue
-                    has_pending = bool(pending_commit and pending_commit.strip())
-                    has_buffer = bool(committer.buf.strip())
-                    if not (has_pending or has_buffer):
+                    await asyncio.sleep(0.5)
+                    idle_for = time.time() - last_voice_event
+                    if idle_for < SILENCE_FLUSH_S:
                         continue
 
                     await flush_pending_commit()
@@ -860,7 +858,20 @@ async def ws_translate(ws: WebSocket):
                         committer.reset_for_new_utterance()
                     except AttributeError:
                         pass
-                    mark_voice_activity()
+
+                    if idle_for >= IDLE_TIMEOUT_S:
+                        closed = True
+                        logger.info("WS idle timeout reached (%.1fs)", idle_for)
+                        notice = {"type": "idle_timeout", "seconds": IDLE_TIMEOUT_S}
+                        try:
+                            await ws.send_json(notice)
+                        except Exception:
+                            pass
+                        try:
+                            await ws.close(code=4000, reason="idle timeout")
+                        except Exception:
+                            pass
+                        return
             except asyncio.CancelledError:
                 pass
 

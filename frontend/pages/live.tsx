@@ -304,6 +304,18 @@ export default function Live() {
         wsUrl,
         async (m: any) => {
           console.log("[WS IN]", m.type, m);
+          if (m.type === "idle_timeout") {
+            const secs = typeof m.seconds === "number" ? m.seconds : undefined;
+            console.log("[WS] idle_timeout received", m);
+            await ctlRef.current?.stop?.().catch(() => {});
+            setStatus("stopped");
+            setErrMsg(
+              secs
+                ? `Session closed after ${secs.toFixed(0)}s of silence.`
+                : "Session closed due to inactivity."
+            );
+            return;
+          }
           if (m.type === "interim_kr") setKrInterim(m.text);
           if (m.type === "final_kr") {
             const tailKo = normKo((m as any).text || "");

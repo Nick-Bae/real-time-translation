@@ -37,13 +37,19 @@ export type ServerTranslationMsg = {
   meta?: Record<string, unknown>;
 };
 
+export type IdleTimeoutMsg = {
+  type: "idle_timeout";
+  seconds?: number;
+};
+
 // Final union (replace your existing one with this)
 export type WsMsg =
   | InterimKrMsg
   | FinalKrMsg
   | FastFinalMsg
   | CommitMsg
-  | ServerTranslationMsg;
+  | ServerTranslationMsg
+  | IdleTimeoutMsg;
 
 
 function throttle(fn: (...args: any[]) => void, ms: number) {
