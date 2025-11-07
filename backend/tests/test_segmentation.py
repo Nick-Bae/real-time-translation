@@ -1,10 +1,19 @@
-from backend.app.segmentation import ClauseCommitter, CommitConfig, KO_CONNECTIVE_HANGING_RE
+from app.segmentation import ClauseCommitter, CommitConfig, KO_CONNECTIVE_HANGING_RE
 
 def test_clause_committer_emits_sentence_endings():
     committer = ClauseCommitter(CommitConfig())
     sentence = "한국의 교회 다니는 50대 이하의 남자들의 1/3이 군대에서 세례를 받아요."
     emitted = committer.feed(sentence)
     assert emitted == sentence.strip()
+
+def test_plain_korean_endings_commit_without_punctuation():
+    committer = ClauseCommitter(CommitConfig())
+    polite = "오늘은 예배를 드려요"
+    assert committer.feed(polite) == polite.strip()
+    committer.reset_for_new_utterance()
+
+    plain = "하나님은 사랑이시다"
+    assert committer.feed(plain) == plain.strip()
 
 def test_hanging_regex_does_not_match_empty_tail():
     assert KO_CONNECTIVE_HANGING_RE.search("") is None

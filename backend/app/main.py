@@ -33,7 +33,6 @@ from app.utils.translate import translate_text
 from app.routes import translate as translate_routes
 from app.routes import hybrid as hybrid_routes
 from app.hybrid_store import best_match_ko
-from app.segmentation import _trim_after_connective
 from app.utils.google_translate import google_translate
 from app.services.google_services import (
     stt_kr_from_bytes_sync,
@@ -422,6 +421,7 @@ async def ws_translate(ws: WebSocket):
             r"(?:"
             r"기\s*때(?:문|문에?)|"  # 기 때문에 / 기 때문…
             r"때(?:문|문에?)|"       # 때문에 / 때문…
+            r"왜냐(?:하면|면)(?:요)?|"  # 왜냐하면 …
             r"(?:으)?니|[아어]서|라서|"
             r"(?:으)?면|다면|"
             r"는?데|지(?:만)?|"
@@ -525,6 +525,14 @@ async def ws_translate(ws: WebSocket):
         # --- coalescer ---
         pending_commit: Optional[str] = None
         commit_task: Optional[asyncio.Task] = None
+        commit_tasks: Set[asyncio.Task] = set()
+
+        # Track background translation fan-out so the connection can await them before closing.
+        def _register_commit_task(coro):
+            task = asyncio.create_task(coro)
+            commit_tasks.add(task)
+            task.add_done_callback(lambda t: commit_tasks.discard(t))
+            return task
 
 
         # --- helpers (place near other utils) ---
@@ -584,9 +592,8 @@ async def ws_translate(ws: WebSocket):
             return s[:i]
 
         async def send_commit_now(websocket, manager, dst_tr: str, ko_text: str) -> bool:
-            nonlocal recent_commit_text, recent_commit_time, ko_committed_prefix, commit_used  # <— important
+            nonlocal recent_commit_text, recent_commit_time, ko_committed_prefix, commit_used
 
-            # --- normalize and compute the exact Korean tail we want to commit (your existing logic) ---
             def _WS_sub(s: str) -> str:
                 return re.sub(r"\s+", " ", (s or "")).strip()
 
@@ -608,7 +615,6 @@ async def ws_translate(ws: WebSocket):
             send_txt = txt
             tail_only = False
 
-            # Keep your tail-after-commits logic
             tail_candidate = _tail_after_commits(txt, ko_committed_prefix)
             if tail_candidate != txt:
                 send_txt = tail_candidate
@@ -625,7 +631,10 @@ async def ws_translate(ws: WebSocket):
             if not send_txt:
                 return False
 
-            # Length/quality guards (your existing MIN_COMMIT_TOKENS/CHARS checks)
+            base_txt = strip_trail_punct(send_txt)
+            if CONNECTIVE_TAIL.search(base_txt):
+                return False
+
             tok_count = _tok_count(send_txt)
             short_clause = tok_count < MIN_COMMIT_TOKENS or len(send_txt) < MIN_COMMIT_CHARS
             if tail_only:
@@ -635,16 +644,12 @@ async def ws_translate(ws: WebSocket):
                 return False
 
             now = time.time()
-            # exact dup guard
             if recent_commit_text and _WS_sub(recent_commit_text) == send_txt and (now - recent_commit_time) < 3.0:
                 return False
 
-            base_txt = strip_trail_punct(send_txt)
             if base_txt.endswith("기") and len(base_txt) > 1:
-                # wait for the connective tail (e.g., “…기 때문에”)
                 return False
 
-            # replace if current grows the previous (prefix growth / variant)
             replace = False
             if recent_commit_text:
                 prev_norm = _WS_sub(recent_commit_text)
@@ -654,92 +659,10 @@ async def ws_translate(ws: WebSocket):
                 elif is_variant(prev_norm, send_txt):
                     replace = True
 
+            commit_used = True
             recent_commit_text = send_txt
             recent_commit_time = now
 
-            # 1) 🔁 HYBRID TRANSLATE the committed KO (needed for both KO + EN fanout)
-            hyb = await hybrid_translate(send_txt, src_lang="ko", tgt_lang=dst_tr or "en")
-            dst_text = hyb["text"]
-            mode = hyb["mode"]            # "pre" | "realtime"
-            score = float(hyb["score"])
-            matched_source = hyb.get("matched_source")
-            origin = hyb.get("origin", "google")
-
-            # 2) Send the KO commit (now enriched with EN + metadata so producers can skip HTTP translate)
-            ko_payload = {
-                "type": "commit",
-                "payload": send_txt,
-                "src": "ko",
-                "dst": dst_tr,
-                "replace": replace,
-                "ts_ms": int(now * 1000),
-                "en": dst_text,
-                "mode": mode,
-                "origin": origin,
-                "score": score,
-            }
-            try:
-                await websocket.send_json(ko_payload)
-            except Exception as e:
-                print("[producer] send commit failed:", e)
-            try:
-                await manager.broadcast(ko_payload)
-            except Exception as e:
-                print("[broadcast] commit failed:", e)
-            try:
-                await broadcast(ko_payload)
-            except Exception as e:
-                logger.warning("[viewer] commit fanout failed: %s", e)
-
-            # (A) Standard event your React hook + viewer consumes
-            trans_payload = {
-                "type": "translation",
-                "lang": dst_tr or "en",
-                "payload": dst_text,
-                "meta": {
-                    "translated": dst_text,
-                    "mode": mode,
-                    "match_score": score,
-                    "matched_source": matched_source,
-                    "partial": False,
-                    "segment_id": None,
-                    "rev": None,
-                    "original": send_txt,
-                    "origin": origin,
-                },
-            }
-            try:
-                await websocket.send_json(trans_payload)
-            except Exception as e:
-                logger.warning("[producer] translation send failed: %s", e)
-            try:
-                await manager.broadcast(trans_payload)
-            except Exception as e:
-                print("[broadcast] translation failed:", e)
-            try:
-                await broadcast(trans_payload)
-            except Exception as e:
-                logger.warning("[viewer] translation fanout failed: %s", e)
-
-            # (B) (Optional) Your legacy schema for other listeners, if any
-            legacy_payload = {
-                "mode": ("prepared" if mode == "pre" else "live"),
-                "text": dst_text,
-                "src": {"text": send_txt, "lang": "ko"},
-                "tgt": {"lang": dst_tr or "en"},
-                "origin": origin,
-                "score": score,
-            }
-            try:
-                await manager.broadcast(legacy_payload)
-            except Exception:
-                pass
-            try:
-                await broadcast(legacy_payload)
-            except Exception as e:
-                logger.warning("[viewer] legacy fanout failed: %s", e)
-
-            # Update committed KO prefix so finals can skip already-spoken clauses
             if replace:
                 ko_committed_prefix = send_txt
             else:
@@ -749,7 +672,98 @@ async def ws_translate(ws: WebSocket):
                 else:
                     ko_committed_prefix = send_txt
 
-            commit_used = True
+            async def _dispatch_commit():
+                try:
+                    hyb = await hybrid_translate(send_txt, src_lang="ko", tgt_lang=dst_tr or "en")
+                except Exception:
+                    logger.exception("hybrid translate failed; emitting source text")
+                    hyb = {
+                        "text": send_txt,
+                        "mode": "realtime",
+                        "origin": "error",
+                        "score": 0.0,
+                        "matched_source": None,
+                    }
+
+                dst_text = hyb.get("text", send_txt)
+                mode = hyb.get("mode", "realtime")
+                score = float(hyb.get("score", 0.0))
+                matched_source = hyb.get("matched_source")
+                origin = hyb.get("origin", "google")
+                ts_ms = int(time.time() * 1000)
+
+                ko_payload = {
+                    "type": "commit",
+                    "payload": send_txt,
+                    "src": "ko",
+                    "dst": dst_tr,
+                    "replace": replace,
+                    "ts_ms": ts_ms,
+                    "en": dst_text,
+                    "mode": mode,
+                    "origin": origin,
+                    "score": score,
+                }
+                try:
+                    await websocket.send_json(ko_payload)
+                except Exception as e:
+                    print("[producer] send commit failed:", e)
+                try:
+                    await manager.broadcast(ko_payload)
+                except Exception as e:
+                    print("[broadcast] commit failed:", e)
+                try:
+                    await broadcast(ko_payload)
+                except Exception as e:
+                    logger.warning("[viewer] commit fanout failed: %s", e)
+
+                trans_payload = {
+                    "type": "translation",
+                    "lang": dst_tr or "en",
+                    "payload": dst_text,
+                    "meta": {
+                        "translated": dst_text,
+                        "mode": mode,
+                        "match_score": score,
+                        "matched_source": matched_source,
+                        "partial": False,
+                        "segment_id": None,
+                        "rev": None,
+                        "original": send_txt,
+                        "origin": origin,
+                    },
+                }
+                try:
+                    await websocket.send_json(trans_payload)
+                except Exception as e:
+                    logger.warning("[producer] translation send failed: %s", e)
+                try:
+                    await manager.broadcast(trans_payload)
+                except Exception as e:
+                    print("[broadcast] translation failed:", e)
+                try:
+                    await broadcast(trans_payload)
+                except Exception as e:
+                    logger.warning("[viewer] translation fanout failed: %s", e)
+
+                legacy_payload = {
+                    "mode": ("prepared" if mode == "pre" else "live"),
+                    "text": dst_text,
+                    "src": {"text": send_txt, "lang": "ko"},
+                    "tgt": {"lang": dst_tr or "en"},
+                    "origin": origin,
+                    "score": score,
+                }
+                try:
+                    await manager.broadcast(legacy_payload)
+                except Exception:
+                    pass
+                try:
+                    await broadcast(legacy_payload)
+                except Exception as e:
+                    logger.warning("[viewer] legacy fanout failed: %s", e)
+
+            _register_commit_task(_dispatch_commit())
             return True
 
 
@@ -763,23 +777,12 @@ async def ws_translate(ws: WebSocket):
             if not txt:
                 return
 
-            # If we have “…기 때문에 … / …지만 … / …는데 …” followed by a new clause,
-            # keep only the left up to the connective for this early commit.
-            # (_trim_after_connective should return (left, right))
-            try:
-                trimmed, _ = _trim_after_connective(txt, "")
-                txt = trimmed or txt
-            except NameError:
-                # If you haven't added _trim_after_connective yet, just skip trimming.
-                pass
-
             # Guards for non-final early commits
             if _tok_count(txt) < MIN_COMMIT_TOKENS or len(txt) < MIN_COMMIT_CHARS:
                 return
             # Block only hanging connective tails like “…기 때문에”, “…지만”, “…는데” with nothing after
             if CONNECTIVE_TAIL.search(strip_trail_punct(txt)):
-                if _tok_count(txt) <= MIN_COMMIT_TOKENS:
-                    return
+                return
 
             # Coalesce: replace any pending commit with the latest snapshot
             snap = txt
@@ -956,6 +959,8 @@ async def ws_translate(ws: WebSocket):
         finally:
             # just in case
             await flush_pending_commit()
+            if commit_tasks:
+                await asyncio.gather(*commit_tasks, return_exceptions=True)
             logger.info("STT supervisor finished")
 
 

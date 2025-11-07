@@ -28,11 +28,6 @@ KO_INNER_ENDER_RE = re.compile(
 )
 
 # Put this near your other regexes (backend/app/segmentation.py)
-KO_TAIL_TOPIC_NP = re.compile(
-    r"^(?:오늘|내일|어제|지금|그때|이제|다음|그리고|또|또한|한편|"
-    r"저|제|나|내|우리|여러분|형제자매|형제들|자매들)\s*(?:은|는)\b"
-)
-
 EN_MARKERS: Sequence[str] = ("but","so","however","therefore","then","and then","because","and")
 EN_END_PUNCT = ".?!"
 
@@ -99,27 +94,6 @@ KO_SUSPECT_TAIL_RE = re.compile(
     r"(?:은|는|이|가|을|를|에|에서|에게|께|로|으로|와|과|도|만|까지|부터|처럼|같이|"
     r"정말|진짜|아주|매우|너무|굉장히|잘|많이|조금|약간|의)\s*$"
 )
-
-# --- New: topic/marker head right after a connective (we should NOT include it in the commit)
-NEXT_TOPIC_OR_MARKER_RE = re.compile(
-    r"^\s*(?:그리고|근데|그런데|그러나|하지만|그래서|그러니까|그럼|그때|또|"
-    r"(?:오늘|내일|어제|지금|여기|거기|우리|저|나)[는]|"   # common topics
-    r"[^\s]+(?:은|는))"                                      # any token ending with 은/는
-)
-
-def _trim_after_connective(left: str, right: str) -> tuple[str, str]:
-    """
-    If 'left' ends at a full connective and 'right' begins with a topic/marker (내일은/그리고/…),
-    keep only the connective in 'left' and push the topic/marker back to 'right'.
-    """
-    if not left:
-        return _norm(left), right
-    # left ended at a *full* connective boundary (not hanging)
-    if KO_CONNECTIVE_BOUNDARY_RE.search(left) and not KO_CONNECTIVE_HANGING_RE.search(left):
-        m = NEXT_TOPIC_OR_MARKER_RE.match(right or "")
-        if m:
-            return _norm(left), (right or "")
-    return _norm(left), right
 
 def _ends_with_ko_ender(s: str) -> bool:
     return any(s.endswith(end) for end in KO_ENDERS)
@@ -321,9 +295,6 @@ class ClauseCommitter:
                 mk_len = _looks_like_tail_marker(head, lang=self.lang)
 
                 # NEW: topic-NP as a marker (commit BEFORE '내일은/오늘은/…')
-                if mk_len == 0 and KO_TAIL_TOPIC_NP.search(head):
-                    mk_len = 1  # any positive → triggers the same logic
-
                 if mk_len:
                     left = inc[:len(prev)].rstrip()
                     if len(_norm(left)) >= 6 and self._should_emit(left):
@@ -340,24 +311,15 @@ class ClauseCommitter:
                 buf_snapshot = self.buf
                 left = buf_snapshot[:k].rstrip()
                 right = buf_snapshot[k:].lstrip()
-
-                # NEW: don't leak the next topic/marker after a connective
-                left, right = _trim_after_connective(left, right)
-
-                if len(_norm(left)) >= 6:
-                    # Avoid emitting subordinate-only fragments like “…기 때문에.”
+                if len(_norm(left)) >= 6 and self._should_emit(left):
                     left_core = _rstrip_tail_punct(left)
                     if KO_SUSPECT_TAIL_RE.search(left_core):
                         self.buf = buf_snapshot
                     elif not right.strip() and KO_CONNECTIVE_HANGING_RE.search(left_core):
-                        # keep full buffer; wait for the main clause
                         self.buf = buf_snapshot
                     else:
                         self.buf = right
-                        self.last_commit_at = time.time()
-                        self.last_left_len = len(left)
-                        return _norm(left)
-
+                        return self._emit(left)
 
         # 3) Full sentence enders
         if self.cfg.commit_on_tail_ender and self._is_tail_ender(self.buf):
