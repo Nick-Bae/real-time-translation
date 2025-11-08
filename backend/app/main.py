@@ -843,7 +843,7 @@ async def ws_translate(ws: WebSocket):
             if snap:
                 await send_commit_now(ws, manager, dst_tr, snap)
 
-        last_voice_event = time.time()
+        last_voice_event: Optional[float] = None  # arm watchdog only after first speech event
 
         def mark_voice_activity():
             nonlocal last_voice_event
@@ -855,6 +855,10 @@ async def ws_translate(ws: WebSocket):
             try:
                 while True:
                     await asyncio.sleep(0.5)
+                    if last_voice_event is None:
+                        # No speech observed yet; keep session warm without closing
+                        continue
+
                     idle_for = time.time() - last_voice_event
                     if idle_for < SILENCE_FLUSH_S:
                         continue
