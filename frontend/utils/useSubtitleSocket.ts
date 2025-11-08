@@ -7,7 +7,13 @@ type FastFinal = { type: "fast_final"; en: string; from?: string };
 type Translation = {
   type: "translation";
   payload?: string;
-  meta?: { translated?: string };
+  lang?: string;
+  meta?: {
+    translated?: string;
+    partial?: boolean;
+    seq?: number;
+    [key: string]: unknown;
+  };
 };
 
 function isInterim(m: any): m is InterimKR { return m && m.type === "interim_kr" && typeof m.text === "string"; }
@@ -61,12 +67,26 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
     return "";
   }, [explicitUrl]);
 
-  // helper: push a new line and trim
+  function splitSentences(text: string): string[] {
+    const normalized = text.replace(/\r/g, "").trim();
+    if (!normalized) return [];
+    const sentenceSplit = normalized
+      .split(/(?<=[.!?。？！])\s+(?=[A-Z가-힣0-9])/u)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (sentenceSplit.length > 1) return sentenceSplit;
+    const newlineSplit = normalized.split(/\n+/).map((s) => s.trim()).filter(Boolean);
+    if (newlineSplit.length > 1) return newlineSplit;
+    return [normalized];
+  }
+
   function pushLine(setter: React.Dispatch<React.SetStateAction<string[]>>, text: string) {
-    setter(prev => {
-      const next = prev.concat(text).slice(-maxLines);
-      return next;
-    });
+    setter((prev) => prev.concat(text).slice(-maxLines));
+  }
+
+  function appendLines(setter: React.Dispatch<React.SetStateAction<string[]>>, lines: string[]) {
+    if (!lines.length) return;
+    setter((prev) => prev.concat(lines).slice(-maxLines));
   }
 
   useEffect(() => {
@@ -117,22 +137,28 @@ export function useSubtitleSocket(explicitUrl?: string, opts: Options = {}) {
             }
 
             if (isTranslation(msg)) {
+              const seq =
+                typeof msg.meta?.seq === "number"
+                  ? msg.meta.seq
+                  : typeof (msg.meta as any)?.segment_id === "number"
+                  ? Number((msg.meta as any).segment_id)
+                  : null;
+              if (msg.meta?.partial || seq === null) {
+                return; // ignore previews lacking a final sequence id
+              }
               const text =
                 (typeof msg.payload === "string" && msg.payload) ||
                 (typeof msg.meta?.translated === "string" && msg.meta.translated) ||
                 "";
               const t = text.trim();
-              if (t) {
-                setEnFinal(t);
-                if (track === "en" || track === "both") pushLine(setEnLines, t);
-              }
+              if (!t) return;
+              setEnFinal(t);
+              if (track === "en" || track === "both") appendLines(setEnLines, splitSentences(t));
               return;
             }
 
             if (isFastFinal(msg)) {
-              const t = (msg.en || "").trim();
-              setEnFinal(t);
-              if (t && (track === "en" || track === "both")) pushLine(setEnLines, t);
+              // Skip fast_final previews on the public display to avoid showing drafts
               return;
             }
           } catch { /* ignore non-JSON */ }

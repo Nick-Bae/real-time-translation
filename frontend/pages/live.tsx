@@ -36,6 +36,13 @@ const VOICE_BY_TR: Record<string, string> = {
 const API = API_URL;
 const WS_BASE = WS_URL;
 
+// Toggle whether streaming clause previews (commit / fast_final / translation) should
+// be shown/spoken before a sentence is finalized. Default: off for production polish.
+const PREVIEW_TEXT_ENABLED =
+  process.env.NEXT_PUBLIC_LIVE_PREVIEW_TEXT === "1";
+const PREVIEW_AUDIO_ENABLED =
+  process.env.NEXT_PUBLIC_LIVE_PREVIEW_AUDIO === "1";
+
 export default function Live() {
   // UI state
   const [srcIdx, setSrcIdx] = useState<number>(0); // default Korean
@@ -146,6 +153,41 @@ export default function Live() {
     pendingCommitTimersRef.current.set(key, timerId);
   }
 
+  type SpeakOutcome = "played" | "duplicate" | "failed";
+
+  async function speakClauseNow(enText: string): Promise<SpeakOutcome> {
+    const normalized = normEn(enText);
+    if (!normalized) return "failed";
+
+    const now = Date.now();
+    for (const [k, t] of recentEnPlayedRef.current) {
+      if (now - t > DEDUP_WINDOW_MS) recentEnPlayedRef.current.delete(k);
+    }
+    const last = recentEnPlayedRef.current.get(normalized);
+    if (last !== undefined && now - last < DEDUP_WINDOW_MS) {
+      return "duplicate";
+    }
+
+    try {
+      const voice = VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D";
+      const res = await fetch(`${API}/api/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: normalized, voice }),
+      });
+      if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
+      const ab = await res.arrayBuffer();
+      if (ab.byteLength > 0) {
+        enqueue({ arrayBuffer: ab });
+        recentEnPlayedRef.current.set(normalized, Date.now());
+        return "played";
+      }
+    } catch (err) {
+      console.error("[TTS] speakClause error", err);
+    }
+    return "failed";
+  }
+
   useEffect(() => {
     return () => {
       pendingCommitTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
@@ -185,13 +227,22 @@ export default function Live() {
           return [...base, existingEn];
         });
         utteranceSegmentCountRef.current = 0;
-        const stamp = Date.now();
-        enByKoRef.current.set(key, {
-          en: existingEn,
-          spoken: existing?.spoken ?? true,
-          ts: stamp,
-        });
-        recentEnPlayedRef.current.set(existingEn, stamp);
+        const alreadySpoken = existing?.spoken ?? false;
+        if (!alreadySpoken) {
+          const outcome = await speakClauseNow(existingEn);
+          const stamp = Date.now();
+          enByKoRef.current.set(key, {
+            en: existingEn,
+            spoken: outcome !== "failed",
+            ts: stamp,
+          });
+        } else {
+          enByKoRef.current.set(key, {
+            en: existingEn,
+            spoken: true,
+            ts: Date.now(),
+          });
+        }
         lastKoKeyRef.current = key;
         return;
       }
@@ -241,9 +292,13 @@ export default function Live() {
           return [...base, finalEn];
         });
         utteranceSegmentCountRef.current = 0;
+        const outcome = await speakClauseNow(finalEn);
         const timestamp = Date.now();
-        recentEnPlayedRef.current.set(finalEn, timestamp);
-        enByKoRef.current.set(key, { en: finalEn, spoken: true, ts: timestamp });
+        enByKoRef.current.set(key, {
+          en: finalEn,
+          spoken: outcome !== "failed",
+          ts: timestamp,
+        });
         lastKoKeyRef.current = key;
       } catch (err) {
         if ((err as any)?.name === "AbortError") return;
@@ -321,71 +376,6 @@ export default function Live() {
             const tailKo = normKo((m as any).text || "");
             setKrFinal(tailKo);
 
-            const now = Date.now();
-            const hadRecentCommit = now - (lastCommitAtRef.current || 0) < KO_WINDOW_MS;
-            if (hadRecentCommit && tailKo) {
-              const tailKey = koKey(tailKo);
-              const tailCore = tailKo.replace(/[\s.,!?…‥·、，"'”’]+$/g, "");
-              const endsWithDa = tailCore.endsWith("다");
-              const prevCommitKey = lastKoKeyRef.current || "";
-              const tailContainsCommit = prevCommitKey ? tailKey.includes(prevCommitKey) : false;
-
-              if (endsWithDa && !tailContainsCommit) {
-                try {
-                  const srcCode = LANGS[srcIdx].tr;
-                  const dstCode = LANGS[dstIdx].tr;
-                  const trRes = await fetch(`${API}/api/translate`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text: tailKo, src: srcCode, dst: dstCode }),
-                  });
-                  if (!trRes.ok) throw new Error(`translate ${trRes.status} ${trRes.statusText}`);
-                  const trJson = await trRes.json().catch(() => ({} as any));
-                  const enText =
-                    (typeof trJson?.text === "string" && trJson.text) ||
-                    (typeof trJson?.translated === "string" && trJson.translated) ||
-                    (typeof trJson?.en === "string" && trJson.en) ||
-                    "";
-                  const enNorm = normEn(enText);
-                  if (enNorm) {
-                    setEn(enNorm);
-                    setSegments((prev) => {
-                      if (!prev.length) {
-                        utteranceSegmentCountRef.current = 1;
-                        return [enNorm];
-                      }
-                      if (utteranceSegmentCountRef.current === 0) {
-                        utteranceSegmentCountRef.current = 1;
-                        return [...prev, enNorm];
-                      }
-                      const last = prev[prev.length - 1];
-                      if (normEn(last) === enNorm) {
-                        return prev;
-                      }
-                      utteranceSegmentCountRef.current += 1;
-                      return [...prev, enNorm];
-                    });
-
-                    if (!seenRecently(recentEnPlayedRef.current, enNorm, DEDUP_WINDOW_MS)) {
-                      const ttsRes = await fetch(`${API}/api/tts`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                          text: enNorm,
-                          voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
-                        }),
-                      });
-                      if (!ttsRes.ok) throw new Error(`TTS ${ttsRes.status} ${ttsRes.statusText}`);
-                      const ab = await ttsRes.arrayBuffer();
-                      if (ab.byteLength > 0) enqueue({ arrayBuffer: ab });
-                    }
-                  }
-                } catch (err) {
-                  console.error("[final_kr suffix TTS]", err);
-                }
-              }
-            }
-
             void translateFinalKo(tailKo);
           }
 
@@ -393,33 +383,12 @@ export default function Live() {
           if (m.type === "fast_final") {
             const ff = m as FastFinalMsg;
 
-            // normalize
             const en = (ff.en || "").replace(/\s+/g, " ").trim();
             if (!en) return;
 
             const seq = typeof ff.seq === "number" ? ff.seq : undefined;
             const now = Date.now();
 
-            // Always update UI (treat as preview/refinement in the last line)
-            setEn(en);
-            setSegments((prev) => {
-              if (utteranceSegmentCountRef.current === 0) {
-                utteranceSegmentCountRef.current = 1;
-                return [...prev, en];
-              }
-              if (!prev.length) {
-                utteranceSegmentCountRef.current = 1;
-                return [en];
-              }
-              const copy = prev.slice();
-              copy[copy.length - 1] = en;
-              return copy;
-            });
-
-            // If we already spoke this seq, bail
-            if (seq && spokenSeqsRef.current.has(seq)) return;
-
-            // Keep KO->EN cache small and current
             if (lastKoKeyRef.current) {
               for (const [k, v] of enByKoRef.current) {
                 if (now - v.ts > KO_WINDOW_MS) enByKoRef.current.delete(k);
@@ -432,36 +401,57 @@ export default function Live() {
               });
             }
 
-            // If a commit was just sent, treat fast_final as preview only (no TTS).
-            // This avoids a double play when the commit TTS lands a moment later.
-            if (now - lastCommitAtRef.current < COMMIT_GRACE_MS && lastKoKeyRef.current) {
+            if (!PREVIEW_TEXT_ENABLED && !PREVIEW_AUDIO_ENABLED) {
               return;
             }
 
-            // Otherwise, speak the fast_final (this is the "no early commit" case).
-            try {
-              const res = await fetch(`${API}/api/tts`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  text: en,
-                  voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
-                }),
-              });
-              if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
-
-              const ab = await res.arrayBuffer();
-              if (ab.byteLength > 0) {
-                enqueue({ arrayBuffer: ab, seq });
-                if (seq) spokenSeqsRef.current.add(seq);
-
-                // Mark spoken for this KO key too (prevents re-speaking on a later commit of same clause)
-                if (lastKoKeyRef.current) {
-                  enByKoRef.current.set(lastKoKeyRef.current, { en, spoken: true, ts: now });
+            if (PREVIEW_TEXT_ENABLED) {
+              setEn(en);
+              setSegments((prev) => {
+                if (utteranceSegmentCountRef.current === 0) {
+                  utteranceSegmentCountRef.current = 1;
+                  return [...prev, en];
                 }
+                if (!prev.length) {
+                  utteranceSegmentCountRef.current = 1;
+                  return [en];
+                }
+                const copy = prev.slice();
+                copy[copy.length - 1] = en;
+                return copy;
+              });
+            }
+
+            if (
+              PREVIEW_AUDIO_ENABLED &&
+              !(now - lastCommitAtRef.current < COMMIT_GRACE_MS && lastKoKeyRef.current)
+            ) {
+              if (seq && spokenSeqsRef.current.has(seq)) {
+                return;
               }
-            } catch (err) {
-              console.error(err);
+
+              try {
+                const res = await fetch(`${API}/api/tts`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    text: en,
+                    voice: VOICE_BY_TR[LANGS[dstIdx].tr] || "en-US-Wavenet-D",
+                  }),
+                });
+                if (!res.ok) throw new Error(`TTS ${res.status} ${res.statusText}`);
+
+                const ab = await res.arrayBuffer();
+                if (ab.byteLength > 0) {
+                  enqueue({ arrayBuffer: ab, seq });
+                  if (seq) spokenSeqsRef.current.add(seq);
+                  if (lastKoKeyRef.current) {
+                    enByKoRef.current.set(lastKoKeyRef.current, { en, spoken: true, ts: Date.now() });
+                  }
+                }
+              } catch (err) {
+                console.error(err);
+              }
             }
           }
 
@@ -482,7 +472,9 @@ export default function Live() {
               const rawKo = typeof (m as any).payload === "string" ? (m as any).payload : "";
               const koClause = normKo(rawKo);
               if (!koClause) return;
-              setKrFinal(koClause);
+              if (PREVIEW_TEXT_ENABLED) {
+                setKrFinal(koClause);
+              }
 
               // --- stable key & caches
               const isReplace = !!(m as any).replace;
@@ -534,30 +526,32 @@ export default function Live() {
               if (!enNorm) return;
 
               // --- replace vs append
-              setEn(enNorm);
-              setSegments((prev) => {
-                if (!prev.length) {
-                  utteranceSegmentCountRef.current = 1;
-                  return [enNorm];
-                }
-                if (isReplace || existingEntry) {
+              if (PREVIEW_TEXT_ENABLED) {
+                setEn(enNorm);
+                setSegments((prev) => {
+                  if (!prev.length) {
+                    utteranceSegmentCountRef.current = 1;
+                    return [enNorm];
+                  }
+                  if (isReplace || existingEntry) {
+                    if (utteranceSegmentCountRef.current === 0) {
+                      utteranceSegmentCountRef.current = 1;
+                    }
+                    const copy = prev.slice();
+                    copy[copy.length - 1] = enNorm; // refine/replace
+                    return copy;
+                  }
                   if (utteranceSegmentCountRef.current === 0) {
                     utteranceSegmentCountRef.current = 1;
+                    return [...prev, enNorm];
                   }
-                  const copy = prev.slice();
-                  copy[copy.length - 1] = enNorm; // refine/replace
-                  return copy;
-                }
-                if (utteranceSegmentCountRef.current === 0) {
-                  utteranceSegmentCountRef.current = 1;
-                  return [...prev, enNorm];
-                }
-                if (normEn(prev[prev.length - 1]) === enNorm) {
-                  return prev; // exact duplicate
-                }
-                utteranceSegmentCountRef.current += 1;
-                return [...prev, enNorm]; // new clause
-              });
+                  if (normEn(prev[prev.length - 1]) === enNorm) {
+                    return prev; // exact duplicate
+                  }
+                  utteranceSegmentCountRef.current += 1;
+                  return [...prev, enNorm]; // new clause
+                });
+              }
 
               const nowTs = Date.now();
               for (const [text, ts] of recentEnPlayedRef.current) {
@@ -580,13 +574,20 @@ export default function Live() {
                 shouldSpeak = false;
               }
 
+              const previewWillSpeak = PREVIEW_AUDIO_ENABLED && shouldSpeak;
+              const nextSpokenState = previewWillSpeak
+                ? false
+                : enChanged
+                ? false
+                : wasSpoken;
+
               enByKoRef.current.set(key, {
                 en: enNorm,
-                spoken: shouldSpeak ? false : true,
+                spoken: nextSpokenState,
                 ts: nowTs,
               });
 
-              if (shouldSpeak) {
+              if (previewWillSpeak) {
                 scheduleCommitSpeak(key, enNorm);
               } else {
                 clearPendingCommitTimer(key);
@@ -622,40 +623,55 @@ export default function Live() {
               lastPlayed !== undefined && now - lastPlayed < DEDUP_WINDOW_MS;
             const existing = key ? enByKoRef.current.get(key) : undefined;
 
-            setEn(enNorm);
-            setSegments((prev) => {
-              if (!prev.length) {
-                utteranceSegmentCountRef.current = 1;
-                return [enNorm];
-              }
-              if (existing) {
+            if (key) {
+              enByKoRef.current.set(key, {
+                en: enNorm,
+                spoken: existing?.spoken ?? false,
+                ts: now,
+              });
+            }
+
+            if (!PREVIEW_TEXT_ENABLED && !PREVIEW_AUDIO_ENABLED) {
+              return;
+            }
+
+            if (PREVIEW_TEXT_ENABLED) {
+              setEn(enNorm);
+              setSegments((prev) => {
+                if (!prev.length) {
+                  utteranceSegmentCountRef.current = 1;
+                  return [enNorm];
+                }
+                if (existing) {
+                  if (utteranceSegmentCountRef.current === 0) {
+                    utteranceSegmentCountRef.current = 1;
+                  }
+                  const copy = prev.slice();
+                  copy[copy.length - 1] = enNorm;
+                  return copy;
+                }
                 if (utteranceSegmentCountRef.current === 0) {
                   utteranceSegmentCountRef.current = 1;
+                  if (normEn(prev[prev.length - 1]) === enNorm) {
+                    return prev;
+                  }
+                  return [...prev, enNorm];
                 }
-                const copy = prev.slice();
-                copy[copy.length - 1] = enNorm;
-                return copy;
-              }
-              if (utteranceSegmentCountRef.current === 0) {
-                utteranceSegmentCountRef.current = 1;
-                if (normEn(prev[prev.length - 1]) === enNorm) {
-                  return prev;
-                }
+                const last = prev[prev.length - 1];
+                if (normEn(last) === enNorm) return prev;
+                utteranceSegmentCountRef.current += 1;
                 return [...prev, enNorm];
-              }
-              const last = prev[prev.length - 1];
-              if (normEn(last) === enNorm) return prev;
-              utteranceSegmentCountRef.current += 1;
-              return [...prev, enNorm];
-            });
+              });
+            }
+
+            if (!PREVIEW_AUDIO_ENABLED) {
+              return;
+            }
 
             if (key) {
               const spoken = existing?.spoken ?? false;
-              enByKoRef.current.set(key, { en: enNorm, spoken, ts: now });
-
               const hasPendingCommit = pendingCommitTimersRef.current.has(key);
-              if (hasPendingCommit || spoken) return;
-              if (isRecentDuplicate) return;
+              if (hasPendingCommit || spoken || isRecentDuplicate) return;
 
               scheduleCommitSpeak(key, enNorm, TRANSLATION_FALLBACK_DELAY_MS);
               return;
