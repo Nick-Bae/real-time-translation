@@ -428,6 +428,8 @@ async def ws_translate(ws: WebSocket):
         COALESCE_MS = 180
         MIN_COMMIT_TOKENS = 2
         MIN_COMMIT_CHARS  = 10
+        MIN_SENTENCE_TOKENS = 4
+        MIN_SENTENCE_CHARS  = 18
         DEDUP_WINDOW_S    = 4.0
         SILENCE_FLUSH_S   = 3.0  # flush buffer after short silence
         IDLE_TIMEOUT_S    = 12.0 # fully stop session after extended silence
@@ -625,6 +627,8 @@ async def ws_translate(ws: WebSocket):
                 return any(core.endswith(sfx) for sfx in KO_SENTENCE_TAIL_SUFFIXES)
 
             txt = _WS_sub(ko_text)
+            prev_prefix_snapshot = ko_committed_prefix
+            full_clause = txt  # preserve full sentence before tail trimming
             if not txt:
                 return False
 
@@ -663,6 +667,14 @@ async def ws_translate(ws: WebSocket):
             if not is_sentence:
                 return False
 
+            if tail_only and prev_prefix_snapshot:
+                full_clause = _WS_sub(f"{prev_prefix_snapshot} {send_txt}")
+            else:
+                full_clause = send_txt
+
+            if _tok_count(full_clause) < MIN_SENTENCE_TOKENS or len(full_clause) < MIN_SENTENCE_CHARS:
+                return False
+
             now = time.time()
             if recent_commit_text and _WS_sub(recent_commit_text) == send_txt and (now - recent_commit_time) < 3.0:
                 return False
@@ -694,18 +706,18 @@ async def ws_translate(ws: WebSocket):
             async def _dispatch_commit():
                 nonlocal seq
                 try:
-                    hyb = await hybrid_translate(send_txt, src_lang="ko", tgt_lang=dst_tr or "en")
+                    hyb = await hybrid_translate(full_clause, src_lang="ko", tgt_lang=dst_tr or "en")
                 except Exception:
                     logger.exception("hybrid translate failed; emitting source text")
                     hyb = {
-                        "text": send_txt,
+                        "text": full_clause,
                         "mode": "realtime",
                         "origin": "error",
                         "score": 0.0,
                         "matched_source": None,
                     }
 
-                dst_text = hyb.get("text", send_txt)
+                dst_text = hyb.get("text", full_clause)
                 mode = hyb.get("mode", "realtime")
                 score = float(hyb.get("score", 0.0))
                 matched_source = hyb.get("matched_source")
@@ -716,7 +728,7 @@ async def ws_translate(ws: WebSocket):
                 if is_sentence:
                     seq += 1
                     segment_id = seq
-                    final_kr_payload = {"type": "final_kr", "text": send_txt, "seq": segment_id}
+                    final_kr_payload = {"type": "final_kr", "text": full_clause, "seq": segment_id}
                     try:
                         await websocket.send_json(final_kr_payload)
                     except Exception:
@@ -760,7 +772,7 @@ async def ws_translate(ws: WebSocket):
                         "segment_id": segment_id,
                         "rev": None,
                         "seq": segment_id,
-                        "original": send_txt,
+                        "original": full_clause,
                         "origin": origin,
                     },
                 }
@@ -772,6 +784,11 @@ async def ws_translate(ws: WebSocket):
                     await manager.broadcast(trans_payload)
                 except Exception as e:
                     print("[broadcast] translation failed:", e)
+                if is_sentence:
+                    try:
+                        await broadcast(trans_payload)
+                    except Exception as e:
+                        logger.warning("[viewer] translation fanout failed: %s", e)
 
                 legacy_payload = {
                     "mode": ("prepared" if mode == "pre" else "live"),
